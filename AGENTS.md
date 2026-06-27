@@ -9,6 +9,9 @@ Live stack:
 - /Volumes/TOSHIBA/AMSR
 - ~/Library/Application Support/neokikoeru/neokikoeru.db
 
+Pipeline source/reference repo:
+- refs/ASMR-Kikoeru -> https://github.com/HachinRo/ASMR-Kikoeru
+
 Important commands:
 - rtk "$HOME/.hermes/asmr/bin/asmr-view" status
 - rtk "$HOME/.hermes/asmr/bin/asmr-view" stop

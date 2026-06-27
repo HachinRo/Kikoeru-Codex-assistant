@@ -39,6 +39,19 @@ NeoKikoeru scan/index --> neokikoeru.db --> asmr-view --> Kikoeru SPA
 The TOSHIBA library is canonical. ASMRoner's metadata database, NeoKikoeru's
 SQLite database, and the compiled Kikoeru frontend are derived state.
 
+## Source and reference repos
+
+The user-maintained public ASMR-Kikoeru source/reference repo is checked out at:
+
+```text
+refs/ASMR-Kikoeru
+https://github.com/HachinRo/ASMR-Kikoeru
+```
+
+Use it as the canonical ASMR-Kikoeru reference for pipeline-related work. The
+other `refs/` checkouts remain comparison references for upstream behavior:
+`refs/kikoeru-express`, `refs/asmr-downloader`, and `refs/neokikoeru`.
+
 ## ASMRoner
 
 Installed binary:

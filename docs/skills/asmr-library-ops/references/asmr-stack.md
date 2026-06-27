@@ -114,6 +114,7 @@ rtk curl -fsS -I "http://127.0.0.1:8890/api/media/stream/ylelmK2e_kI?token="
 
 Use these for behavior comparison and source-level ideas:
 
+- `refs/ASMR-Kikoeru`: user-maintained public GitHub repo, remote `https://github.com/HachinRo/ASMR-Kikoeru`; treat as the canonical ASMR-Kikoeru source/reference for pipeline-related work.
 - `refs/kikoeru-express`: original Kikoeru API/UI behavior, especially search, tags, groups, and works.
 - `refs/asmr-downloader`: ASMR download/subtitle reference behavior.
 - `refs/neokikoeru`: NeoKikoeru indexing/storage/task model.
