@@ -1,0 +1,4 @@
+interface:
+  display_name: "ASMR Library Ops"
+  short_description: "Repair ASMR-library and Kikoeru stack."
+  default_prompt: "Use $asmr-library-ops to inspect, repair, refresh, and verify the local ASMR-library media stack."
