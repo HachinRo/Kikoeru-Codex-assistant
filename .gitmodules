@@ -1,0 +1,3 @@
+[submodule "refs/ASMR-Kikoeru"]
+	path = refs/ASMR-Kikoeru
+	url = https://github.com/HachinRo/ASMR-Kikoeru.git
