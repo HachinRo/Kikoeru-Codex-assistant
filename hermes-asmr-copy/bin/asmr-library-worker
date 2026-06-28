@@ -1,0 +1,471 @@
+#!/bin/sh
+#
+# Hermes ASMR library worker.
+#
+# Do not call ASMRoner directly from Hermes. This wrapper provides stable RJ
+# folders, locking, staging, verification, and atomic publication.
+#
+
+set -eu
+umask 077
+
+VOLUME_ROOT="${ASMR_VOLUME_ROOT:-${HOME}/ASMR}"
+LIBRARY_ROOT="${ASMR_LIBRARY_ROOT:-${VOLUME_ROOT}/AMSR}"
+STAGING_ROOT="${ASMR_STAGING_ROOT:-${VOLUME_ROOT}/AMSR.incoming}"
+HERMES_ROOT="${HERMES_HOME:-${HOME}/.hermes}"
+STATE_ROOT="${HERMES_ASMR_HOME:-${HERMES_ROOT}/asmr}"
+DOWNLOADER_BIN="${ASMRONER_BIN:-${STATE_ROOT}/bin/asmroner}"
+CONFIG_FILE="${STATE_ROOT}/.asmroner-data/config.toml"
+LOG_ROOT="${STATE_ROOT}/logs"
+LOCK_ROOT="${STATE_ROOT}/locks"
+TEST_MODE="${ASMR_TEST_MODE:-0}"
+
+LOCK_PATH=""
+LOCK_HELD=0
+
+say() {
+    printf '%s\n' "$*"
+}
+
+warn() {
+    printf 'WARN: %s\n' "$*" >&2
+}
+
+fail() {
+    printf 'FAILED: %s\n' "$*" >&2
+    exit 1
+}
+
+usage() {
+    cat <<'WORKER_USAGE'
+Usage:
+  asmr-library-worker download RJ01234567
+  asmr-library-worker status RJ01234567
+  asmr-library-worker retry RJ01234567
+
+Completed works are never overwritten. A failed download remains in
+${ASMR_STAGING_ROOT:-${HOME}/ASMR/AMSR.incoming} and must be retried explicitly.
+WORKER_USAGE
+}
+
+normalize_rj() {
+    normalized="$(printf '%s' "$1" | tr '[:lower:]' '[:upper:]')"
+    printf '%s\n' "${normalized}" | grep -E '^RJ[0-9]+$' >/dev/null 2>&1 ||
+        fail "Invalid RJ code '$1'. Expected RJ followed by digits."
+    printf '%s\n' "${normalized}"
+}
+
+volume_is_mounted() {
+    if [ "${TEST_MODE}" = "1" ]; then
+        return 0
+    fi
+    mount | grep -F " on ${VOLUME_ROOT} " >/dev/null 2>&1
+}
+
+require_volume() {
+    volume_is_mounted ||
+        fail "${VOLUME_ROOT} is not mounted. Connect the TOSHIBA drive and retry."
+    [ -d "${VOLUME_ROOT}" ] || fail "Volume directory is missing: ${VOLUME_ROOT}"
+    [ -w "${VOLUME_ROOT}" ] || fail "Volume is not writable: ${VOLUME_ROOT}"
+    [ -d "${LIBRARY_ROOT}" ] || fail "Library directory is missing: ${LIBRARY_ROOT}"
+    [ -d "${STAGING_ROOT}" ] || fail "Staging directory is missing: ${STAGING_ROOT}"
+}
+
+release_lock() {
+    if [ "${LOCK_HELD}" -eq 1 ] && [ -d "${LOCK_PATH}" ]; then
+        owner_pid="$(cat "${LOCK_PATH}/pid" 2>/dev/null || true)"
+        if [ "${owner_pid}" = "$$" ]; then
+            rm -rf -- "${LOCK_PATH}"
+        fi
+    fi
+    LOCK_HELD=0
+}
+
+trap 'release_lock' EXIT
+trap 'release_lock; exit 130' HUP INT TERM
+
+acquire_lock() {
+    rj="$1"
+    LOCK_PATH="${LOCK_ROOT}/${rj}.lock"
+    mkdir -p "${LOCK_ROOT}/stale"
+
+    if mkdir "${LOCK_PATH}" 2>/dev/null; then
+        :
+    else
+        owner_pid="$(cat "${LOCK_PATH}/pid" 2>/dev/null || true)"
+        if [ -n "${owner_pid}" ] && kill -0 "${owner_pid}" 2>/dev/null; then
+            fail "${rj} is already being processed by PID ${owner_pid}."
+        fi
+
+        stale_path="${LOCK_ROOT}/stale/${rj}.lock.$(date -u '+%Y%m%dT%H%M%SZ').$$"
+        if mv "${LOCK_PATH}" "${stale_path}" 2>/dev/null; then
+            :
+        else
+            fail "Could not archive a stale lock for ${rj}; another worker may have won the race."
+        fi
+
+        mkdir "${LOCK_PATH}" 2>/dev/null ||
+            fail "Could not acquire lock for ${rj}."
+    fi
+
+    printf '%s\n' "$$" >"${LOCK_PATH}/pid"
+    date -u '+%Y-%m-%dT%H:%M:%SZ' >"${LOCK_PATH}/started_at"
+    LOCK_HELD=1
+}
+
+find_payload() {
+    stage="$1"
+    rj="$2"
+
+    # ASMRoner creates one descriptive child directory beginning with the RJ
+    # code. Ignore Finder's harmless .DS_Store at the staging root.
+    set -- "${stage}"/*
+    if [ "$#" -ne 1 ] || [ ! -d "$1" ]; then
+        return 1
+    fi
+
+    payload="$1"
+    payload_name="$(basename "${payload}")"
+    case "${payload_name}" in
+        "${rj}"-*) printf '%s\n' "${payload}" ;;
+        *) return 1 ;;
+    esac
+}
+
+has_nonempty_audio() {
+    payload="$1"
+    found="$(
+        find "${payload}" -type f \
+            \( -iname '*.mp3' -o -iname '*.wav' -o -iname '*.flac' \
+               -o -iname '*.m4a' -o -iname '*.aac' -o -iname '*.ogg' \
+               -o -iname '*.opus' \) \
+            -size +0c -print -quit 2>/dev/null
+    )"
+    [ -n "${found}" ]
+}
+
+has_zero_byte_audio() {
+    payload="$1"
+    found="$(
+        find "${payload}" -type f \
+            \( -iname '*.mp3' -o -iname '*.wav' -o -iname '*.flac' \
+               -o -iname '*.m4a' -o -iname '*.aac' -o -iname '*.ogg' \
+               -o -iname '*.opus' \) \
+            -size 0c -print -quit 2>/dev/null
+    )"
+    [ -n "${found}" ]
+}
+
+has_partial_files() {
+    payload="$1"
+    found="$(
+        find "${payload}" -type f \
+            \( -iname '*.part' -o -iname '*.partial' -o -iname '*.tmp' \
+               -o -iname '*.download' -o -iname '*.crdownload' \) \
+            -print -quit 2>/dev/null
+    )"
+    [ -n "${found}" ]
+}
+
+validate_payload() {
+    payload="$1"
+    has_nonempty_audio "${payload}" ||
+        fail "Verification found no non-empty supported audio file."
+    if has_zero_byte_audio "${payload}"; then
+        fail "Verification found a zero-byte audio file."
+    fi
+    if has_partial_files "${payload}"; then
+        fail "Verification found a partial-download file."
+    fi
+}
+
+status_one() {
+    rj="$1"
+    final_path="${LIBRARY_ROOT}/${rj}"
+    stage_path="${STAGING_ROOT}/${rj}.partial"
+    lock_path="${LOCK_ROOT}/${rj}.lock"
+    log_path="${LOG_ROOT}/${rj}.log"
+
+    if ! volume_is_mounted; then
+        say "UNAVAILABLE ${rj}: ${VOLUME_ROOT} is not mounted."
+        return 2
+    fi
+
+    if [ -d "${final_path}" ]; then
+        say "COMPLETE ${rj}: ${final_path}"
+        return 0
+    fi
+
+    if [ -d "${lock_path}" ]; then
+        owner_pid="$(cat "${lock_path}/pid" 2>/dev/null || true)"
+        if [ -n "${owner_pid}" ] && kill -0 "${owner_pid}" 2>/dev/null; then
+            say "IN_PROGRESS ${rj}: PID ${owner_pid}; log ${log_path}"
+            return 0
+        fi
+        say "STALE_LOCK ${rj}: retry will archive the stale lock."
+        return 1
+    fi
+
+    if [ -d "${stage_path}" ]; then
+        say "INCOMPLETE ${rj}: use retry; log ${log_path}"
+        return 1
+    fi
+
+    say "NOT_FOUND ${rj}: no completed, running, or staged job."
+    return 1
+}
+
+run_fill() {
+    # Fill missing files for a work that is already partially
+    # published at ${final_path}. Re-downloads the full work via
+    # asmroner to a one-off temp dir, then merges new files into
+    # the published folder with `cp -n` (no-clobber). Files already
+    # on disk are preserved untouched.
+    #
+    # This is the right action when:
+    #   * the work has SOME files on disk but is missing others
+    #     (e.g. asmroner's original torrent only had 2/3 tracks,
+    #     or a partial staging was lost)
+    #   * `asmr-library status` would say COMPLETE (the existing
+    #     worker treats "folder exists" as complete) but the
+    #     user knows it's actually missing files
+    #
+    # For a brand-new download where nothing is on disk, use
+    # `download` instead. For a partially-staged work (data
+    # under AMSR.incoming/<RJ>.partial), use `retry`.
+    rj="$1"
+    final_path="${LIBRARY_ROOT}/${rj}"
+    log_path="${LOG_ROOT}/${rj}.log"
+    lock_path="${LOCK_ROOT}/${rj}.lock"
+
+    require_volume
+    [ -x "${DOWNLOADER_BIN}" ] || fail "Downloader is missing or not executable: ${DOWNLOADER_BIN}"
+    [ -f "${CONFIG_FILE}" ] || fail "ASMRoner configuration is missing: ${CONFIG_FILE}"
+
+    if [ ! -d "${final_path}" ]; then
+        fail "${rj} is not on disk. Use 'asmr-library download ${rj}' instead."
+    fi
+
+    acquire_lock "${rj}"
+
+    # Recheck after acquiring the lock to close the race with
+    # another worker.
+    if [ ! -d "${final_path}" ]; then
+        say "GONE ${rj}: target disappeared during lock acquisition."
+        return 1
+    fi
+
+    # Use a per-RJ temp under the staging root so concurrent fills
+    # for different RJs don't collide. The .fill suffix keeps it
+    # distinct from the partial-staging pattern (${rj}.partial)
+    # so `retry` and `status` don't see it.
+    fill_stage="${STAGING_ROOT}/${rj}.fill"
+    rm -rf -- "${fill_stage}"
+    mkdir -p "${LOG_ROOT}" "${fill_stage}"
+
+    {
+        printf '\n=== %s fill %s ===\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "${rj}"
+        printf 'fill_stage=%s\n' "${fill_stage}"
+        printf 'final=%s\n' "${final_path}"
+    } >>"${log_path}"
+
+    set +e
+    (
+        cd "${STATE_ROOT}" || exit 90
+        "${DOWNLOADER_BIN}" download "${rj}" -d "${fill_stage}"
+    ) >>"${log_path}" 2>&1
+    downloader_status=$?
+    set -e
+
+    if [ "${downloader_status}" -ne 0 ]; then
+        warn "${rj} asmroner exited with status ${downloader_status}; fill_stage preserved for inspection: ${fill_stage}"
+        return 1
+    fi
+
+    payload="$(find_payload "${fill_stage}" "${rj}" 2>/dev/null || true)"
+    if [ -z "${payload}" ]; then
+        warn "${rj} asmroner did not produce a recognizable payload under ${fill_stage}; fill_stage preserved."
+        return 1
+    fi
+
+    # Walk the new payload and cp -n each file into the published
+    # folder. -n (no-clobber) preserves any existing file the user
+    # has manually edited or that differs from the torrent source.
+    # Files of different sizes are reported but not deleted — the
+    # user can resolve manually.
+    #
+    # POSIX sh doesn't have arrays or process substitution, so we
+    # use a here-doc with `find` and per-file argument passing.
+    added=0
+    kept=0
+    conflicts=0
+    bytes_added=0
+    while IFS= read -r src; do
+        rel="${src#${payload}/}"
+        dest="${final_path}/${rel}"
+        if [ ! -e "${dest}" ]; then
+            mkdir -p -- "$(dirname -- "${dest}")"
+            if cp -p -- "${src}" "${dest}" 2>>"${log_path}"; then
+                added=$((added + 1))
+                sz="$(stat -f%z "${src}" 2>/dev/null || echo 0)"
+                bytes_added=$((bytes_added + sz))
+            else
+                warn "cp failed: ${rel}"
+            fi
+        elif [ "$(stat -f%z "${src}" 2>/dev/null)" = "$(stat -f%z "${dest}" 2>/dev/null)" ]; then
+            kept=$((kept + 1))
+        else
+            conflicts=$((conflicts + 1))
+            warn "size conflict (existing kept): ${rel}  src=$(stat -f%z "${src}")  dest=$(stat -f%z "${dest}")"
+        fi
+    done <<EOF
+$(find "${payload}" -type f)
+EOF
+
+    rm -rf -- "${fill_stage}"
+
+    completed_at="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    {
+        printf 'fill_completed=%s\n' "${completed_at}"
+        printf 'fill_added=%d\n' "${added}"
+        printf 'fill_kept=%d\n' "${kept}"
+        printf 'fill_conflicts=%d\n' "${conflicts}"
+        printf 'fill_bytes_added=%d\n' "${bytes_added}"
+    } >>"${log_path}"
+
+    if [ "${added}" -eq 0 ] && [ "${conflicts}" -eq 0 ]; then
+        say "FILL_NOOP ${rj}: no missing files; ${kept} already on disk."
+    else
+        say "FILLED ${rj}: added=${added} kept=${kept} conflicts=${conflicts} bytes_added=${bytes_added}; log ${log_path}"
+        say "Run 'asmr-library build' to refresh the Neokikoeru index."
+    fi
+    return 0
+}
+
+
+run_download() {
+    mode="$1"
+    rj="$2"
+    final_path="${LIBRARY_ROOT}/${rj}"
+    stage_path="${STAGING_ROOT}/${rj}.partial"
+    log_path="${LOG_ROOT}/${rj}.log"
+
+    require_volume
+    [ -x "${DOWNLOADER_BIN}" ] || fail "Downloader is missing or not executable: ${DOWNLOADER_BIN}"
+    [ -f "${CONFIG_FILE}" ] || fail "ASMRoner configuration is missing: ${CONFIG_FILE}"
+
+    if [ -d "${final_path}" ]; then
+        say "SKIPPED ${rj}: already present at ${final_path}"
+        return 0
+    fi
+
+    if [ "${mode}" = "download" ] && [ -d "${stage_path}" ]; then
+        fail "${rj} has incomplete staging data. Use retry instead."
+    fi
+
+    if [ "${mode}" = "retry" ] && [ ! -d "${stage_path}" ]; then
+        fail "${rj} has no incomplete staging data. Use download instead."
+    fi
+
+    acquire_lock "${rj}"
+
+    # Recheck after acquiring the lock to close the race with another request.
+    if [ -d "${final_path}" ]; then
+        say "SKIPPED ${rj}: already present at ${final_path}"
+        return 0
+    fi
+
+    mkdir -p "${stage_path}" "${LOG_ROOT}"
+    {
+        printf '\n=== %s %s %s ===\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "${mode}" "${rj}"
+        printf 'staging=%s\n' "${stage_path}"
+    } >>"${log_path}"
+
+    set +e
+    (
+        cd "${STATE_ROOT}" || exit 90
+        "${DOWNLOADER_BIN}" download "${rj}" -d "${stage_path}"
+    ) >>"${log_path}" 2>&1
+    downloader_status=$?
+    set -e
+
+    if [ "${downloader_status}" -ne 0 ]; then
+        fail "${rj} downloader exited with status ${downloader_status}; staging preserved; log ${log_path}"
+    fi
+
+    payload="$(find_payload "${stage_path}" "${rj}" 2>/dev/null || true)"
+    [ -n "${payload}" ] ||
+        fail "${rj} did not produce exactly one expected payload directory; staging preserved; log ${log_path}"
+
+    unexpected_entry="$(
+        find "${stage_path}" -mindepth 1 -maxdepth 1 \
+            ! -path "${payload}" ! -name '.DS_Store' -print -quit 2>/dev/null
+    )"
+    [ -z "${unexpected_entry}" ] ||
+        fail "${rj} staging contains an unexpected entry; staging preserved; log ${log_path}"
+
+    validate_payload "${payload}"
+
+    completed_at="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    cat >"${payload}/.hermes-download.json" <<METADATA_EOF
+{
+  "rj": "${rj}",
+  "completed_at": "${completed_at}",
+  "downloader": "ASMRoner v2.0.6",
+  "workflow": "hermes-asmr-library"
+}
+METADATA_EOF
+
+    [ ! -e "${final_path}" ] || fail "Final path appeared during verification: ${final_path}"
+
+    # Both roots are siblings on the same mounted volume, so this rename is
+    # atomic: the scanner sees either no RJ folder or the complete RJ folder.
+    mv "${payload}" "${final_path}"
+    rm -f -- "${stage_path}/.DS_Store"
+    rmdir "${stage_path}" 2>/dev/null ||
+        warn_path="${stage_path} (non-payload staging entries remain)"
+
+    {
+        printf 'completed=%s\n' "${completed_at}"
+        printf 'final=%s\n' "${final_path}"
+    } >>"${log_path}"
+
+    if [ -n "${warn_path:-}" ]; then
+        say "COMPLETE ${rj}: ${final_path}; warning: ${warn_path}"
+    else
+        say "COMPLETE ${rj}: ${final_path}"
+    fi
+}
+
+main() {
+    [ "$#" -eq 2 ] || {
+        usage >&2
+        exit 2
+    }
+
+    action="$1"
+    rj="$(normalize_rj "$2")"
+
+    mkdir -p "${LOG_ROOT}" "${LOCK_ROOT}"
+
+    case "${action}" in
+        download)
+            run_download download "${rj}"
+            ;;
+        retry)
+            run_download retry "${rj}"
+            ;;
+        fill)
+            run_fill "${rj}"
+            ;;
+        status)
+            status_one "${rj}"
+            ;;
+        *)
+            usage >&2
+            exit 2
+            ;;
+    esac
+}
+
+main "$@"
