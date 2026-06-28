@@ -10,7 +10,7 @@ Live stack:
 - <NEOKIKOERU_DB>
 
 Pipeline source/reference repo:
-- refs/ASMR-Kikoeru -> [https://github.com/HachinRo/ASMR-Kikoeru](https://github.com/HachinRo/Kikoeru-Codex-assistant)
+- refs/ASMR-Kikoeru -> https://github.com/HachinRo/Kikoeru-Codex-assistant
 
 Important commands:
 - rtk "<ASMR_STACK_ROOT>/bin/asmr-view" status
