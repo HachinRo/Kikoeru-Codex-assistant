@@ -224,3 +224,12 @@ local/
 *.bak*
 .DS_Store
 node_modules/
+
+# Local Codex / ASMR operator state. These can contain private notes, backups,
+# cookies, databases, logs, generated indexes, and media files.
+.serena/
+MEMORY.md
+MEMORY.md.backup-*
+memory/
+memory-backup-*/
+hermes-asmr-copy/
