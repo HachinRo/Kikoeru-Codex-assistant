@@ -1,0 +1,139 @@
+#!/bin/sh
+# Rebuild NeoKikoeru file rows for one work from the on-disk library folder.
+set -eu
+
+RJ="${1:?usage: asmr-fix-content-workflow RJ01234567}"
+RJ="$(printf '%s' "$RJ" | tr '[:lower:]' '[:upper:]')"
+case "$RJ" in
+  RJ[0-9]*) ;;
+  *) echo "Bad RJ code: $RJ" >&2; exit 2 ;;
+esac
+
+LIBRARY_ROOT="${ASMR_LIBRARY_ROOT:-${HOME}/ASMR}"
+DB="${NEOKIKOERU_DB:-${HOME}/Library/Application Support/neokikoeru/neokikoeru.db}"
+WORK_DIR="${LIBRARY_ROOT}/${RJ}"
+
+if [ ! -d "$WORK_DIR" ]; then
+  echo "Work folder not found: $WORK_DIR" >&2
+  exit 1
+fi
+
+python3 - "$RJ" "$WORK_DIR" "$DB" <<'PY'
+import base64
+import hashlib
+import os
+import sqlite3
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+rj = sys.argv[1]
+work_dir = Path(sys.argv[2])
+db_path = Path(sys.argv[3])
+audio_exts = {".mp3", ".wav", ".flac", ".m4a", ".aac", ".ogg", ".opus"}
+
+def file_id(path: str) -> str:
+    digest = hashlib.sha256(path.encode("utf-8")).digest()[:8]
+    return base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
+
+def duration(path: Path) -> float:
+    if path.suffix.lower() not in audio_exts:
+        return 0.0
+    try:
+        out = subprocess.check_output(
+            [
+                "ffprobe",
+                "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                str(path),
+            ],
+            text=True,
+            stderr=subprocess.DEVNULL,
+            timeout=8,
+        ).strip()
+        return max(0.0, float(out or 0))
+    except Exception:
+        return 0.0
+
+def rel_db_path(path: Path) -> str:
+    rel = path.relative_to(work_dir).as_posix()
+    return f"/{rj}" if rel == "." else f"/{rj}/{rel}"
+
+def wanted_entries():
+    entries = []
+    for root, dirs, files in os.walk(work_dir):
+        dirs[:] = sorted(d for d in dirs if not d.startswith("."))
+        root_path = Path(root)
+        for d in dirs:
+            p = root_path / d
+            entries.append((p, True))
+        for f in sorted(files):
+            if f.startswith(".") or f == ".DS_Store":
+                continue
+            entries.append((root_path / f, False))
+    return entries
+
+conn = sqlite3.connect(db_path)
+conn.row_factory = sqlite3.Row
+now = int(time.time() * 1000)
+inserted_folders = 0
+inserted_files = 0
+
+with conn:
+    work = conn.execute("SELECT id FROM works WHERE id = ?", (rj,)).fetchone()
+    if not work:
+        raise SystemExit(f"Work metadata row is missing: {rj}")
+
+    root_path = f"/{rj}"
+    root_id = file_id(root_path)
+    root = conn.execute("SELECT id FROM files WHERE work_id = ? AND parent_id IS NULL AND is_folder = 1", (rj,)).fetchone()
+    if root:
+        root_id = root["id"]
+        conn.execute("UPDATE files SET path = ?, key = ?, name = ?, storage_id = 1, updated_at = ? WHERE id = ?", (root_path, root_path, rj, now, root_id))
+    else:
+        conn.execute(
+            """INSERT INTO files (id, path, key, name, size, duration, is_folder, encrypted, created_at, updated_at, parent_id, storage_id, work_id)
+               VALUES (?, ?, ?, ?, 0, 0, 1, 0, ?, ?, NULL, 1, ?)""",
+            (root_id, root_path, root_path, rj, now, now, rj),
+        )
+        inserted_folders += 1
+
+    conn.execute("DELETE FROM files WHERE work_id = ? AND path LIKE ?", (rj, f"/{rj}/%"))
+
+    id_by_path = {root_path: root_id}
+    for path, is_folder in wanted_entries():
+        db_path_value = rel_db_path(path)
+        parent_path = str(Path(db_path_value).parent)
+        if parent_path == ".":
+            parent_path = root_path
+        parent_id = id_by_path.get(parent_path)
+        if not parent_id:
+            raise SystemExit(f"Missing parent row for {db_path_value}: {parent_path}")
+        fid = file_id(db_path_value)
+        name = path.name
+        size = 0 if is_folder else path.stat().st_size
+        dur = 0.0 if is_folder else duration(path)
+        conn.execute(
+            """INSERT INTO files (id, path, key, name, size, duration, is_folder, encrypted, created_at, updated_at, parent_id, storage_id, work_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, 1, ?)""",
+            (fid, db_path_value, db_path_value, name, size, dur, 1 if is_folder else 0, now, now, parent_id, rj),
+        )
+        id_by_path[db_path_value] = fid
+        if is_folder:
+            inserted_folders += 1
+        else:
+            inserted_files += 1
+
+total = conn.execute("SELECT COUNT(*) FROM files WHERE work_id = ?", (rj,)).fetchone()[0]
+audio = conn.execute(
+    "SELECT COUNT(*) FROM files WHERE work_id = ? AND is_folder = 0 AND lower(substr(name, -4)) IN ('.mp3','.wav','.m4a','.aac','.ogg')",
+    (rj,),
+).fetchone()[0]
+conn.close()
+
+print(f"Fixed content index for {rj}")
+print(f"folder={work_dir}")
+print(f"inserted_folders={inserted_folders} inserted_files={inserted_files} total_db_rows={total} audio_rows={audio}")
+PY

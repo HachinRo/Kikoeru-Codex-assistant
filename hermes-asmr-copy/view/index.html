@@ -1,0 +1,371 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>asmr-view · Neokikoeru Local</title>
+  <link rel="icon" href="/favicon.ico">
+
+  <!-- Quasar CSS from CDN -->
+  <link href="https://cdn.jsdelivr.net/npm/quasar@2.16.10/dist/quasar.prod.css" rel="stylesheet">
+  <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+JP:wght@400;700&display=swap" rel="stylesheet">
+
+  <style>
+    body { font-family: "Noto Sans JP", -apple-system, BlinkMacSystemFont, "Helvetica Neue", sans-serif; }
+    .work-card { transition: transform 0.15s ease, box-shadow 0.15s ease; cursor: pointer; }
+    .work-card:hover { transform: translateY(-2px); box-shadow: 0 4px 12px rgba(0,0,0,0.15); }
+    .work-cover { width: 100%; aspect-ratio: 1/1; object-fit: cover; background: #1a1a1a; }
+    .work-cover-placeholder { width: 100%; aspect-ratio: 1/1; display: flex; align-items: center; justify-content: center; background: #1a1a1a; color: #555; font-size: 24px; }
+    .file-row { display: flex; align-items: center; gap: 12px; padding: 10px 12px; border-bottom: 1px solid rgba(255,255,255,0.06); transition: background 0.1s; }
+    .file-row:hover { background: rgba(255,255,255,0.04); }
+    .file-row.playing { background: rgba(103, 194, 58, 0.12); border-left: 3px solid #67c23a; }
+    .file-icon { width: 32px; text-align: center; font-size: 18px; opacity: 0.8; flex-shrink: 0; }
+    .file-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .file-size, .file-duration { font-size: 12px; color: #999; min-width: 70px; text-align: right; flex-shrink: 0; }
+    .file-actions { display: flex; gap: 4px; flex-shrink: 0; }
+    .breadcrumb { display: flex; gap: 4px; align-items: center; flex-wrap: wrap; padding: 8px 12px; background: rgba(255,255,255,0.03); border-bottom: 1px solid rgba(255,255,255,0.06); }
+    .breadcrumb-item { cursor: pointer; color: #67c23a; }
+    .breadcrumb-item:hover { text-decoration: underline; }
+    .breadcrumb-sep { color: #666; }
+    .meta-section { padding: 16px; }
+    .meta-section h3 { font-size: 13px; text-transform: uppercase; letter-spacing: 1px; color: #888; margin: 0 0 8px 0; }
+    .genre-chip { margin: 2px; }
+    .audio-player { position: sticky; bottom: 0; left: 0; right: 0; background: #1d1d1d; border-top: 1px solid #333; padding: 10px 16px; display: flex; gap: 12px; align-items: center; z-index: 100; }
+    .audio-player .name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .audio-player audio { height: 36px; max-width: 50vw; }
+    .empty-state { padding: 40px 16px; text-align: center; color: #888; }
+    .rating-stars { color: #f5c518; font-size: 13px; }
+    .stat-pill { display: inline-block; padding: 2px 8px; background: rgba(255,255,255,0.08); border-radius: 10px; font-size: 11px; margin-right: 4px; }
+    .q-page { padding-bottom: 80px; }
+    .grid-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 16px; padding: 16px; }
+    .search-bar { padding: 12px 16px; background: #1d1d1d; }
+    .file-list-header { display: flex; align-items: center; gap: 12px; padding: 8px 12px; background: rgba(255,255,255,0.02); font-size: 11px; text-transform: uppercase; letter-spacing: 1px; color: #888; }
+    .file-list-header .file-icon { width: 32px; }
+    .file-list-header .file-size, .file-list-header .file-duration { font-size: 11px; }
+  </style>
+</head>
+<body>
+<div id="app">
+  <q-layout view="hHh Lpr fFf" style="min-height: 100vh;">
+    <q-header elevated class="bg-dark text-white">
+      <q-toolbar>
+        <q-btn flat dense round icon="menu" aria-label="Menu" @click="goHome" />
+        <q-toolbar-title>
+          <span class="cursor-pointer" @click="goHome">asmr-view</span>
+          <span class="text-caption text-grey-5 q-ml-sm">{{ worksCount }} works</span>
+        </q-toolbar-title>
+        <q-btn flat dense round icon="refresh" @click="reload" />
+      </q-toolbar>
+    </q-header>
+
+    <q-page-container>
+      <!-- Works list view -->
+      <q-page v-if="route.name === 'home'" class="q-pa-none">
+        <div class="search-bar">
+          <q-input dark dense standout v-model="search" @keydown.enter="doSearch" placeholder="Search by RJ id, title, or maker...">
+            <template v-slot:append>
+              <q-icon name="search" class="cursor-pointer" @click="doSearch" />
+            </template>
+          </q-input>
+        </div>
+        <div v-if="loading" class="empty-state">Loading...</div>
+        <div v-else-if="works.length === 0" class="empty-state">No works found.</div>
+        <div v-else>
+          <div class="grid-list">
+            <div v-for="w in works" :key="w.id" class="work-card" @click="openWork(w.id)">
+              <img v-if="w.has_cover" class="work-cover" :src="'/api/cover/' + w.id" :alt="w.title" loading="lazy">
+              <div v-else class="work-cover-placeholder">📦</div>
+              <div class="q-pa-xs">
+                <div class="text-caption text-grey-5">{{ w.id }}</div>
+                <div class="text-body2 ellipsis-2-lines" :title="w.title" style="line-height: 1.2; min-height: 2.4em;">{{ w.title }}</div>
+                <div class="text-caption text-grey-6 ellipsis">{{ w.maker || '' }}</div>
+                <div class="row items-center q-mt-xs">
+                  <span class="rating-stars" v-if="w.rating > 0">★ {{ w.rating.toFixed(2) }}</span>
+                  <span class="text-caption text-grey-7 q-ml-xs" v-if="w.file_count > 0">{{ w.file_count }} files</span>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div class="row justify-center q-pa-md">
+            <q-pagination v-model="page" :max="totalPages" direction-links boundary-links @update:model-value="loadWorks" />
+          </div>
+        </div>
+      </q-page>
+
+      <!-- Work detail view -->
+      <q-page v-else-if="route.name === 'work'" class="q-pa-none" style="display: flex; flex-direction: column; min-height: calc(100vh - 50px);">
+        <div v-if="loadingWork" class="empty-state">Loading...</div>
+        <div v-else-if="!work" class="empty-state">Work not found.</div>
+        <div v-else style="display: flex; flex: 1; min-height: 0;">
+          <!-- Sidebar -->
+          <div style="width: 320px; background: #181818; overflow-y: auto; flex-shrink: 0;">
+            <img v-if="work.has_cover" :src="'/api/cover/' + work.id" :alt="work.title" style="width: 100%; display: block;">
+            <div v-else class="work-cover-placeholder">📦</div>
+            <div class="meta-section">
+              <div class="text-caption text-grey-5">{{ work.id }}</div>
+              <h2 class="q-my-sm text-h6" style="line-height: 1.3;">{{ work.title }}</h2>
+              <div v-if="work.maker" class="text-body2 text-grey-5 q-mb-sm">by {{ work.maker }}</div>
+              <div class="row q-gutter-xs q-mb-sm">
+                <span class="stat-pill" v-if="work.released">{{ work.released }}</span>
+                <span class="stat-pill" v-if="work.rating > 0">★ {{ work.rating.toFixed(2) }} ({{ work.rating_count }})</span>
+                <span class="stat-pill" v-if="work.file_count">{{ work.file_count }} files</span>
+                <span class="stat-pill" v-if="work.total_size">{{ formatSize(work.total_size) }}</span>
+              </div>
+              <div v-if="work.intro" class="text-body2 text-grey-5" style="line-height: 1.5; white-space: pre-wrap;">{{ work.intro }}</div>
+              <h3 v-if="work.genres && work.genres.length" class="q-mt-md">Genres</h3>
+              <div v-if="work.genres && work.genres.length">
+                <q-chip v-for="g in work.genres" :key="g" dense color="grey-9" text-color="white" class="genre-chip">{{ g }}</q-chip>
+              </div>
+              <h3 v-if="work.artists && work.artists.length" class="q-mt-md">CV</h3>
+              <div v-if="work.artists && work.artists.length">
+                <q-chip v-for="a in work.artists" :key="a.id" dense color="blue-grey-9" text-color="white" class="genre-chip">{{ a.name }}</q-chip>
+              </div>
+            </div>
+          </div>
+
+          <!-- File list -->
+          <div style="flex: 1; display: flex; flex-direction: column; min-width: 0;">
+            <div class="breadcrumb">
+              <span class="breadcrumb-item" @click="loadFiles('')">Home</span>
+              <span class="breadcrumb-sep">/</span>
+              <span class="breadcrumb-item" @click="loadFiles(work.id)">{{ work.id }}</span>
+              <template v-for="(b, i) in filesMeta.breadcrumb" :key="b.path">
+                <span class="breadcrumb-sep">/</span>
+                <span class="breadcrumb-item" @click="loadFiles(b.path)">{{ b.name }}</span>
+              </template>
+              <span class="text-caption text-grey-7 q-ml-auto" v-if="filesMeta.items">{{ filesMeta.items.length }} items</span>
+            </div>
+            <div class="file-list-header">
+              <span class="file-icon"></span>
+              <span class="file-name">Name</span>
+              <span class="file-size">Size</span>
+              <span class="file-duration">Length</span>
+              <span style="width: 80px; flex-shrink: 0; text-align: right;">Actions</span>
+            </div>
+            <div style="flex: 1; overflow-y: auto;">
+              <div v-for="item in filesMeta.items" :key="item.id" class="file-row" :class="{ playing: currentFile && currentFile.id === item.id }">
+                <div class="file-icon">{{ iconFor(item) }}</div>
+                <div class="file-name" :title="item.path">
+                  <span v-if="item.is_folder" class="text-weight-medium cursor-pointer text-primary" @click="loadFiles(item.path)">{{ item.name }}</span>
+                  <span v-else>{{ item.name }}</span>
+                </div>
+                <div class="file-size">{{ item.is_folder ? '' : formatSize(item.size) }}</div>
+                <div class="file-duration">{{ item.is_folder || !item.duration ? '' : formatDuration(item.duration) }}</div>
+                <div class="file-actions" style="width: 80px; justify-content: flex-end;">
+                  <q-btn v-if="!item.is_folder && isPlayable(item)" flat dense round icon="play_arrow" size="sm" color="primary" @click="play(item)" />
+                  <q-btn v-if="!item.is_folder" flat dense round icon="download" size="sm" @click="download(item)" />
+                </div>
+              </div>
+              <div v-if="!filesMeta.items || filesMeta.items.length === 0" class="empty-state">Empty folder.</div>
+            </div>
+          </div>
+        </div>
+      </q-page>
+
+      <!-- Sticky audio player -->
+      <div v-if="currentFile" class="audio-player">
+        <q-icon name="music_note" size="md" color="primary" />
+        <div class="name">
+          <div class="text-caption text-grey-5">{{ currentFile.work_id || currentFile.path.split('/').slice(0, -1).join('/') }}</div>
+          <div>{{ currentFile.name }}</div>
+        </div>
+        <audio ref="audioEl" :src="currentFile.streamUrl" controls autoplay @ended="currentFile = null" />
+        <q-btn flat dense round icon="close" @click="currentFile = null" />
+      </div>
+    </q-page-container>
+  </q-layout>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/vue@3.4.27/dist/vue.global.prod.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/quasar@2.16.10/dist/quasar.umd.prod.js"></script>
+
+<script>
+const { createApp, ref, computed, onMounted, watch } = Vue;
+const Quasar = window.Quasar;
+
+const app = createApp({
+  setup() {
+    const route = ref(parseRoute());
+    const works = ref([]);
+    const work = ref(null);
+    const filesMeta = ref({ items: [], breadcrumb: [] });
+    const search = ref("");
+    const page = ref(1);
+    const totalPages = ref(1);
+    const worksCount = ref(0);
+    const loading = ref(false);
+    const loadingWork = ref(false);
+    const currentFile = ref(null);
+    const audioEl = ref(null);
+
+    function parseRoute() {
+      const hash = location.hash.replace(/^#/, "") || "/";
+      if (hash.startsWith("/work/")) {
+        const rest = hash.slice(6);
+        const slash = rest.indexOf("/");
+        if (slash === -1) return { name: "work", rj: rest, path: "" };
+        return { name: "work", rj: rest.slice(0, slash), path: rest.slice(slash + 1) };
+      }
+      return { name: "home" };
+    }
+
+    function goHome() {
+      location.hash = "#/";
+    }
+
+    function openWork(rj) {
+      location.hash = "#/work/" + rj;
+    }
+
+    window.addEventListener("hashchange", () => {
+      route.value = parseRoute();
+      if (route.value.name === "home") loadWorks();
+      else if (route.value.name === "work") loadWork();
+    });
+
+    async function loadWorks() {
+      loading.value = true;
+      try {
+        const qs = new URLSearchParams({ page: page.value, size: 24, search: search.value });
+        const r = await fetch("/api/works?" + qs);
+        const d = await r.json();
+        works.value = d.works;
+        totalPages.value = Math.max(1, Math.ceil(d.total / d.size));
+        worksCount.value = d.total;
+      } catch (e) {
+        console.error(e);
+        Quasar.Notify.create({ message: "Load failed: " + e.message, color: "negative" });
+      } finally {
+        loading.value = false;
+      }
+    }
+
+    function doSearch() {
+      page.value = 1;
+      loadWorks();
+    }
+
+    function reload() {
+      if (route.value.name === "home") loadWorks();
+      else if (route.value.name === "work") { loadWork(); loadFiles(currentPath.value); }
+    }
+
+    async function loadWork() {
+      loadingWork.value = true;
+      try {
+        const r = await fetch("/api/work/" + route.value.rj);
+        if (!r.ok) throw new Error("HTTP " + r.status);
+        work.value = await r.json();
+        // Sub-path after the work id in the URL: #/work/RJ{id}/rest...
+        const hash = location.hash.replace(/^#/, "");
+        const m = hash.match(/^\/work\/[^/]+(\/.*)?$/);
+        const sub = m && m[1] ? decodeURIComponent(m[1]).replace(/^\//, "") : "";
+        loadFiles(sub);
+      } catch (e) {
+        work.value = null;
+        Quasar.Notify.create({ message: "Load failed: " + e.message, color: "negative" });
+      } finally {
+        loadingWork.value = false;
+      }
+    }
+
+    const currentPath = ref("");
+    function loadFiles(path) {
+      currentPath.value = path || "";
+      // Update hash to keep state (only when meaningfully different)
+      const baseHash = "#/work/" + work.value.id;
+      const newHash = path ? baseHash + "/" + path : baseHash;
+      if (location.hash !== newHash) {
+        history.replaceState(null, "", newHash);
+        route.value = parseRoute();
+      }
+      const qs = new URLSearchParams({ rj: work.value.id, path: path || "" });
+      fetch("/api/files?" + qs)
+        .then(r => r.json())
+        .then(d => { filesMeta.value = d; })
+        .catch(e => Quasar.Notify.create({ message: "Files load failed: " + e.message, color: "negative" }));
+    }
+
+    function play(item) {
+      if (item.is_folder) {
+        loadFiles(item.path);
+        return;
+      }
+      const streamUrl = "/api/stream/" + encodeURIComponent(item.id);
+      currentFile.value = { ...item, work_id: work.value.id, streamUrl };
+      // Play next item in list when current ends
+      const items = filesMeta.value.items;
+      const idx = items.findIndex(i => i.id === item.id);
+      if (audioEl.value) {
+        audioEl.value.onended = () => {
+          // Try next playable file
+          for (let i = idx + 1; i < items.length; i++) {
+            const next = items[i];
+            if (!next.is_folder && isPlayable(next)) { play(next); return; }
+          }
+          currentFile.value = null;
+        };
+      }
+    }
+
+    function download(item) {
+      const streamUrl = "/api/stream/" + encodeURIComponent(item.id);
+      const a = document.createElement("a");
+      a.href = streamUrl;
+      a.download = item.name;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+    }
+
+    function iconFor(item) {
+      if (item.is_folder) return "📁";
+      const n = item.name.toLowerCase();
+      if (n.endsWith(".mp3") || n.endsWith(".wav") || n.endsWith(".flac") || n.endsWith(".ogg") || n.endsWith(".m4a")) return "🎵";
+      if (n.endsWith(".jpg") || n.endsWith(".jpeg") || n.endsWith(".png") || n.endsWith(".webp") || n.endsWith(".gif")) return "🖼️";
+      if (n.endsWith(".txt") || n.endsWith(".pdf") || n.endsWith(".md")) return "📄";
+      if (n.endsWith(".lrc") || n.endsWith(".srt") || n.endsWith(".vtt") || n.endsWith(".ass")) return "💬";
+      if (n.endsWith(".mp4") || n.endsWith(".mkv") || n.endsWith(".webm")) return "🎬";
+      return "📄";
+    }
+
+    function isPlayable(item) {
+      const n = item.name.toLowerCase();
+      return /\.(mp3|wav|flac|ogg|m4a|aac|opus)$/i.test(n);
+    }
+
+    function formatSize(bytes) {
+      if (!bytes) return "";
+      const units = ["B", "KB", "MB", "GB", "TB"];
+      let i = 0;
+      let v = bytes;
+      while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+      return v.toFixed(v >= 100 ? 0 : 1) + " " + units[i];
+    }
+
+    function formatDuration(seconds) {
+      if (!seconds) return "";
+      const m = Math.floor(seconds / 60);
+      const s = Math.floor(seconds % 60);
+      return m + ":" + String(s).padStart(2, "0");
+    }
+
+    onMounted(() => {
+      if (route.value.name === "home") loadWorks();
+      else if (route.value.name === "work") loadWork();
+    });
+
+    return {
+      route, works, work, filesMeta, search, page, totalPages, worksCount,
+      loading, loadingWork, currentFile, audioEl,
+      goHome, openWork, doSearch, reload, loadFiles, play, download,
+      iconFor, isPlayable, formatSize, formatDuration,
+    };
+  }
+});
+
+app.use(Quasar, { config: { brand: { primary: "#67c23a" } } });
+app.mount("#app");
+</script>
+</body>
+</html>

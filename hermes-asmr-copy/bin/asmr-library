@@ -1,0 +1,416 @@
+#!/bin/sh
+# Consolidated ASMR library command.
+# Safe library operations use the Hermes worker; ASMRoner utility operations are
+# run from the pinned state directory so config.toml resolves consistently.
+
+set -eu
+umask 077
+
+HERMES_ROOT="${HERMES_HOME:-${HOME}/.hermes}"
+STATE_ROOT="${HERMES_ASMR_HOME:-${HERMES_ROOT}/asmr}"
+WORKER_BIN="${ASMR_LIBRARY_WORKER_BIN:-${STATE_ROOT}/bin/asmr-library-worker}"
+ASMRONER_BIN="${ASMRONER_BIN:-${STATE_ROOT}/bin/asmroner}"
+
+usage() {
+    cat <<'USAGE'
+Usage:
+  asmr-library download RJ01234567 [RJ...]
+  asmr-library status RJ01234567 [RJ...]
+  asmr-library retry RJ01234567 [RJ...]
+  asmr-library fill RJ01234567 [RJ...]
+  asmr-library search <RJID-or-query> [asmroner search flags]
+  asmr-library sync [asmroner sync args]
+  asmr-library fetch-neokikoeru
+  asmr-library build                    # run NeoKikoeru start/login/scan/index/tasks
+  asmr-library reindex                  # run NeoKikoeru metadata/cover scan only
+asmr-library dashboard                    # show integrated dashboard URL on port 8890
+  asmr-library serve [start|stop|status|login|storage|logs|version|init|config]
+  asmr-library config [asmroner config args]
+  asmr-library version
+  asmr-library files <RJ>               # list files in a work (DB-backed, no license needed)
+  asmr-library fcat <file_id>           # stream a file from Neokikoeru to stdout
+  asmr-library fget <file_id> [out]     # download a file from Neokikoeru
+  asmr-library works [page]             # list works via Neokikoeru API
+  asmr-library work <RJ>                # get work metadata via Neokikoeru API
+  asmr-library subs <login|check|fetch|list-missing|fetch-missing> ...
+                                       # fetch Chinese subtitles from asmr.one;
+                                       # auto-discovers the sub-having sibling RJ
+                                       # (簡体中文 > 繁体中文 > original) and matches
+                                       # by position to the local audio files
+  asmr-library asmroner <raw asmroner args>
+
+Safe library commands (download/status/retry) go through asmr-library-worker.
+serve runs Neokikoeru (the only viewer) against a symlink index of the library.
+listen has been removed: Neokikoeru replaces ASMRoner's listen path.
+ASMRoner utility commands run from ~/.hermes/asmr so its config is found.
+
+Neokikoeru's native file list is license-gated (only chobit.cc preview shows for
+unactivated installs). The files/fcat/fget/works/work/subcommands use the
+unencrypted API + direct DB read to give you the full file view without a license.
+USAGE
+}
+
+fail() {
+    printf 'FAILED: %s\n' "$*" >&2
+    exit 1
+}
+
+need_worker() {
+    [ -x "${WORKER_BIN}" ] || fail "Worker is missing or not executable: ${WORKER_BIN}"
+}
+
+need_asmroner() {
+    [ -x "${ASMRONER_BIN}" ] || fail "ASMRoner is missing or not executable: ${ASMRONER_BIN}"
+    [ -d "${STATE_ROOT}" ] || fail "ASMR state directory is missing: ${STATE_ROOT}"
+}
+
+run_worker_many() {
+    action="$1"
+    shift
+    [ "$#" -gt 0 ] || fail "${action} requires at least one RJ code."
+    need_worker
+    asmr_subs_bin="${STATE_ROOT}/bin/asmr-subs"
+    auto_subs=1
+    # Filter --no-subs out; pass the rest to the worker.
+    new_args=""
+    for a in "$@"; do
+        case "${a}" in
+            --no-subs)
+                auto_subs=0
+                ;;
+            --help|-h)
+                usage
+                exit 0
+                ;;
+            --*)
+                fail "Unknown flag '${a}' for '${action}'."
+                ;;
+            *)
+                new_args="${new_args}${new_args:+ }${a}"
+                ;;
+        esac
+    done
+    if [ -z "${new_args}" ]; then
+        fail "${action} requires at least one RJ code."
+    fi
+    # shellcheck disable=SC2086
+    set -- ${new_args}
+    status=0
+    for rj in "$@"; do
+        "${WORKER_BIN}" "${action}" "${rj}" || status=$?
+        # After a successful download, opportunistically fetch Chinese
+        # subtitles from asmr.one. asmr.one's track tree and download
+        # CDN are both unauthenticated for the endpoints we hit, so this
+        # runs without requiring a session. Set ASMR_NO_AUTO_SUBS=1 or
+        # pass --no-subs to the wrapper to opt out.
+        if [ "${action}" = "download" ] && [ "${auto_subs}" = "1" ] \
+                && [ -z "${ASMR_NO_AUTO_SUBS:-}" ] && [ -x "${asmr_subs_bin}" ]; then
+            printf '\n--- asmr-library subs auto-fetch for %s ---\n' "${rj}"
+            "${asmr_subs_bin}" fetch "${rj}" 2>&1 || true
+        fi
+    done
+    exit "${status}"
+}
+
+run_asmroner() {
+    need_asmroner
+    cd "${STATE_ROOT}"
+    exec "${ASMRONER_BIN}" "$@"
+}
+
+run_asmroner_capture() {
+    need_asmroner
+    cd "${STATE_ROOT}"
+    "${ASMRONER_BIN}" "$@"
+}
+
+run_build() {
+    serve_bin="${STATE_ROOT}/bin/neokikoeru-serve"
+    [ -x "${serve_bin}" ] || fail "neokikoeru-serve is missing or not executable: ${serve_bin}"
+    storage_id="${ASMR_STORAGE_ID:-1}"
+    printf '%s\n' "Starting NeoKikoeru maintenance service..."
+    "${serve_bin}" start --no-index
+token="$(
+    python3 - "${STATE_ROOT}/serve-config.json" <<'PY'
+import json
+import sys
+try:
+    with open(sys.argv[1], encoding="utf-8") as f:
+        print(json.load(f).get("token") or "")
+except Exception:
+    print("")
+PY
+)"
+    if [ -n "${token}" ]; then
+        printf '%s\n' "Using saved NeoKikoeru JWT."
+    else
+        printf '%s\n' "Ensuring NeoKikoeru JWT..."
+        "${serve_bin}" login
+    fi
+    printf '%s\n' "Triggering DLsite metadata scan for storage ${storage_id}..."
+    "${serve_bin}" storage scan "${storage_id}"
+    printf '%s\n' "Triggering filesystem index for storage ${storage_id}..."
+    "${serve_bin}" storage index "${storage_id}"
+    printf '%s\n' "Current NeoKikoeru tasks:"
+    "${serve_bin}" tasks
+}
+
+run_reindex() {
+    serve_bin="${STATE_ROOT}/bin/neokikoeru-serve"
+    [ -x "${serve_bin}" ] || fail "neokikoeru-serve is missing or not executable: ${serve_bin}"
+
+    storage_id="${ASMR_STORAGE_ID:-1}"
+    printf '%s\n' "Starting NeoKikoeru maintenance service..."
+    "${serve_bin}" start --no-index
+    token="$(
+        python3 - "${STATE_ROOT}/serve-config.json" <<'PY'
+import json
+import sys
+try:
+    with open(sys.argv[1], encoding="utf-8") as f:
+        print(json.load(f).get("token") or "")
+except Exception:
+    print("")
+PY
+    )"
+    if [ -n "${token}" ]; then
+        printf '%s\n' "Using saved NeoKikoeru JWT."
+    else
+        printf '%s\n' "Ensuring NeoKikoeru JWT..."
+        "${serve_bin}" login
+    fi
+    printf '%s\n' "Triggering DLsite metadata/cover scan for storage ${storage_id}..."
+    "${serve_bin}" storage scan "${storage_id}"
+    printf '%s\n' "Current NeoKikoeru tasks:"
+    "${serve_bin}" tasks
+}
+
+build_listen_index() {
+    source_root="${ASMR_LIBRARY_ROOT:-${HOME}/ASMR}"
+    index_root="${ASMR_LISTEN_INDEX_ROOT:-${STATE_ROOT}/listen-index}"
+    metadata_file="${STATE_ROOT}/listen-index-metadata.json"
+    rj_file="${STATE_ROOT}/listen-index-rjs.txt"
+    [ -d "${source_root}" ] || fail "ASMR library directory is missing: ${source_root}"
+
+    python3 - "${source_root}" "${rj_file}" <<'PY'
+from pathlib import Path
+import re
+import sys
+source_root = Path(sys.argv[1])
+rj_file = Path(sys.argv[2])
+rjs = [p.name.upper() for p in sorted(source_root.iterdir()) if p.is_dir() and re.match(r'^RJ\d+$', p.name, re.I)]
+rj_file.write_text(','.join(rjs), encoding='utf-8')
+print(f"Found {len(rjs)} RJ folders")
+PY
+
+    rjs="$(cat "${rj_file}")"
+    if [ -n "${rjs}" ]; then
+        tmp_metadata="${metadata_file}.tmp.json"
+        rm -f -- "${tmp_metadata}"
+        if run_asmroner_capture search export "${rjs}" -n 10000 -f "${tmp_metadata}" >/dev/null 2>&1 && [ -s "${tmp_metadata}" ]; then
+            mv "${tmp_metadata}" "${metadata_file}"
+        else
+            rm -f -- "${tmp_metadata}"
+            printf '[]\n' >"${metadata_file}"
+        fi
+    else
+        printf '[]\n' >"${metadata_file}"
+    fi
+
+    rm -rf -- "${index_root}"
+    mkdir -p "${index_root}"
+    python3 - "${source_root}" "${index_root}" "${metadata_file}" <<'PY'
+from pathlib import Path
+import csv
+import json
+import re
+import subprocess
+import sys
+source_root = Path(sys.argv[1])
+index_root = Path(sys.argv[2])
+metadata_file = Path(sys.argv[3])
+subtitle_exts = {'.vtt', '.srt', '.ass', '.ssa', '.lrc'}
+audio_buckets = {
+    '.mp3': 'MP3',
+    '.wav': 'WAV',
+    '.flac': 'FLAC',
+    '.m4a': 'M4A',
+    '.aac': 'AAC',
+    '.ogg': 'OGG',
+    '.opus': 'OPUS',
+}
+metadata_by_rj = {}
+try:
+    raw_metadata = metadata_file.read_text(encoding='utf-8')
+    try:
+        parsed_metadata = json.loads(raw_metadata)
+    except Exception:
+        parsed_metadata = list(csv.DictReader(raw_metadata.splitlines()))
+    for item in parsed_metadata:
+        source_id = str(item.get('source_id', '')).upper()
+        if source_id:
+            metadata_by_rj[source_id] = item
+except Exception:
+    pass
+
+def fetch_exact_metadata(rj):
+    tmp_path = Path('/tmp') / f'asmr-library-meta-{rj}.json'
+    try:
+        try:
+            tmp_path.unlink()
+        except FileNotFoundError:
+            pass
+        subprocess.run(
+            ['asmr-library', 'search', 'export', rj, '-n', '10', '-f', str(tmp_path)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=45,
+            check=False,
+        )
+        if not tmp_path.exists() or tmp_path.stat().st_size == 0:
+            return None
+        for item in json.loads(tmp_path.read_text(encoding='utf-8')):
+            if str(item.get('source_id', '')).upper() == rj.upper():
+                return item
+    except Exception:
+        return None
+    finally:
+        try:
+            tmp_path.unlink()
+        except FileNotFoundError:
+            pass
+    return None
+
+def safe_title(value):
+    value = (value or '').strip() or 'untitled'
+    value = re.sub(r'[-\s/:]+', '_', value)
+    value = re.sub(r'_+', '_', value).strip('_') or 'untitled'
+    return value[:120]
+
+def bucket_for(path):
+    suffix = path.suffix.lower()
+    if suffix in audio_buckets:
+        return audio_buckets[suffix]
+    if suffix in subtitle_exts:
+        return 'Subtitles'
+    if suffix in {'.jpg', '.jpeg', '.png', '.webp', '.gif'}:
+        return 'Images'
+    if suffix in {'.txt', '.pdf', '.json'}:
+        return 'Docs'
+    return 'Other'
+
+works = 0
+links = 0
+enriched = 0
+for work in sorted(source_root.iterdir()):
+    if not work.is_dir() or not re.match(r'^RJ\d+$', work.name, re.I):
+        continue
+    rj = work.name.upper()
+    metadata = metadata_by_rj.get(rj) or fetch_exact_metadata(rj) or {}
+    if metadata:
+        enriched += 1
+    release = str(metadata.get('release') or '00000000').replace('-', '')
+    if not re.match(r'^\d{8}$', release):
+        release = '00000000'
+    has_subtitles = bool(metadata.get('has_subtitle')) or any(
+        item.is_file() and item.suffix.lower() in subtitle_exts
+        for item in work.rglob('*')
+    )
+    title = safe_title(metadata.get('title') or rj)
+    folder_name = f"{rj}-{release}-{'sub' if has_subtitles else 'nosub'}-{title}"
+    target_folder = index_root / folder_name
+    target_folder.mkdir(parents=True, exist_ok=True)
+    for item in work.rglob('*'):
+        if item.is_dir():
+            continue
+        bucket = bucket_for(item)
+        target = target_folder / bucket / item.relative_to(work)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            target.symlink_to(item)
+        except FileExistsError:
+            pass
+        links += 1
+    works += 1
+print(f"Indexed {works} works ({enriched} metadata-enriched, {links} file links) from {source_root} into {index_root}")
+PY
+    printf '%s\n' "${index_root}"
+}
+
+run_listen() {
+    shift
+    if [ "$#" -eq 0 ]; then
+        data_dir="$(build_listen_index | tail -n 1)"
+        run_asmroner listen "${data_dir}"
+    fi
+    if [ "$#" -eq 1 ] && printf '%s\n' "$1" | grep -E '^[0-9]+$' >/dev/null 2>&1; then
+        data_dir="$(build_listen_index | tail -n 1)"
+        run_asmroner listen -p "$1" "${data_dir}"
+    fi
+    run_asmroner listen "$@"
+}
+
+if [ "$#" -eq 0 ]; then
+    usage
+    exit 0
+fi
+
+case "$1" in
+    -h|--help|help)
+        usage
+        ;;
+    download|status|retry|fill)
+        action="$1"
+        shift
+        run_worker_many "${action}" "$@"
+        ;;
+    search|sync|config|completion|version)
+        run_asmroner "$@"
+        ;;
+    fetch-neokikoeru)
+        "${STATE_ROOT}/bin/neokikoeru-fetch"
+        ;;
+build)
+        shift
+        [ "$#" -eq 0 ] || fail "build does not accept arguments. Set ASMR_STORAGE_ID to override storage id."
+        run_build
+        ;;
+reindex)
+        shift
+        [ "$#" -eq 0 ] || fail "reindex does not accept arguments. Set ASMR_STORAGE_ID to override storage id."
+        run_reindex
+        ;;
+dashboard)
+    shift
+    [ "$#" -eq 0 ] || fail "standalone dashboard port is retired. Use http://127.0.0.1:8890/asmr-library"
+    if "${STATE_ROOT}/bin/asmr-view" status >/dev/null 2>&1; then
+        printf '%s\n' "ASMR Library Dashboard: http://127.0.0.1:8890/asmr-library"
+    else
+        "${STATE_ROOT}/bin/asmr-view" --port 8890 start
+        printf '%s\n' "ASMR Library Dashboard: http://127.0.0.1:8890/asmr-library"
+    fi
+    ;;
+    serve)
+        shift
+        "${STATE_ROOT}/bin/neokikoeru-serve" "$@"
+        ;;
+    asmroner)
+        shift
+        run_asmroner "$@"
+        ;;
+    files|fcat|fget|works|work)
+        "${STATE_ROOT}/bin/asmr-neo" "$@"
+        ;;
+    view)
+        shift
+        "${STATE_ROOT}/bin/asmr-view" "$@"
+        ;;
+    subs)
+        shift
+        "${STATE_ROOT}/bin/asmr-subs" "$@"
+        ;;
+    *)
+        fail "Unknown command '$1'. Run: asmr-library --help"
+        ;;
+esac

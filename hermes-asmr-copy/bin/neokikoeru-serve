@@ -1,0 +1,525 @@
+#!/bin/sh
+# Wrapper around the Neokikoeru binary. Manages config.json, the running
+# process, the admin password / JWT, and (optionally) the local storage
+# entry that points at the asmr-library symlink index.
+set -eu
+umask 077
+
+HERMES_ROOT="${HERMES_HOME:-${HOME}/.hermes}"
+STATE_ROOT="${HERMES_ASMR_HOME:-${HERMES_ROOT}/asmr}"
+BIN="${STATE_ROOT}/bin/neokikoeru"
+LOG_DIR="${STATE_ROOT}/logs"
+INDEXER="${STATE_ROOT}/lib/serve_index.py"
+PID_FILE="${STATE_ROOT}/serve.pid"
+LOG_FILE="${LOG_DIR}/serve.log"
+CONFIG_FILE="${STATE_ROOT}/serve-config.json"
+DEFAULT_PORT="8889"
+DEFAULT_ADMIN_USER="admin"
+LIBRARY_ROOT="${ASMR_LIBRARY_ROOT:-${HOME}/ASMR}"
+INDEX_ROOT="${ASMR_SERVE_INDEX_ROOT:-${STATE_ROOT}/serve-index}"
+NK_DATA_DIR="${HOME}/Library/Application Support/neokikoeru"
+NK_CONFIG="${NK_DATA_DIR}/config.json"
+
+mkdir -p "${LOG_DIR}" "${NK_DATA_DIR}" "${INDEX_ROOT}"
+
+usage() {
+    cat <<'USAGE'
+Usage:
+  neokikoeru-serve init [--port PORT]   # write config.json (does not start the server)
+  neokikoeru-serve start [--port PORT] [--no-index] [--foreground]
+  neokikoeru-serve stop
+  neokikoeru-serve status
+  neokikoeru-serve logs [-n LINES]
+  neokikoeru-serve version
+  neokikoeru-serve login [USERNAME] [PASSWORD]  # fetch a JWT and persist it
+  neokikoeru-serve storage add [PATH]            # register a local storage entry
+  neokikoeru-serve storage list                  # list registered storages
+  neokikoeru-serve storage scan [ID]             # trigger DLsite metadata scrape (async)
+  neokikoeru-serve storage index [ID]            # trigger filesystem re-index (async; needed for audio)
+  neokikoeru-serve tasks                         # poll admin task queue
+  neokikoeru-serve config [--show]               # show on-disk serve-config.json
+USAGE
+}
+
+fail() { printf 'FAILED: %s\n' "$*" >&2 ; exit 1 ; }
+say()  { printf '%s\n' "$*"; }
+
+ensure_binary() {
+    [ -x "${BIN}" ] || "${STATE_ROOT}/bin/neokikoeru-fetch" || fail "neokikoeru binary missing and fetch failed"
+}
+
+# Tiny JSON read for the few fields we maintain. Avoids jq.
+read_cfg() {
+    cfg_field="$1"
+    if [ ! -f "${CONFIG_FILE}" ]; then return 1; fi
+    python3 -c "
+import json, sys
+try:
+    d = json.load(open('${CONFIG_FILE}'))
+    v = d.get('${cfg_field}', '')
+    print('' if v is None else v)
+except Exception:
+    sys.exit(1)
+" 2>/dev/null
+}
+
+# Build a JSON object from KEY=VALUE pairs on the argument list. Atomic via tmp+mv.
+write_cfg() {
+    tmp="${CONFIG_FILE}.tmp"
+    python3 - "$@" > "${tmp}" <<'PY'
+import json, sys
+d = {}
+for kv in sys.argv[1:]:
+    if "=" not in kv: continue
+    k, v = kv.split("=", 1)
+    d[k] = v
+print(json.dumps(d, indent=2, ensure_ascii=False))
+PY
+    mv "${tmp}" "${CONFIG_FILE}"
+}
+
+# Write the Neokikoeru data-dir config.json. Port and JWT secret are the
+# only fields we override; the rest mirrors the upstream defaults verbatim.
+#
+# bind_host: default to 127.0.0.1 so the service is only reachable on
+# the local machine. Override with NK_BIND_HOST=0.0.0.0 if you need
+# LAN access (the Neokikoeru WebUI has no auth beyond the JWT, so
+# binding to 0.0.0.0 on a public network is a security risk).
+write_nk_config() {
+    port="$1"
+    bind_host="${NK_BIND_HOST:-127.0.0.1}"
+    cat > "${NK_CONFIG}" <<JSON
+{
+  "log": {
+    "enabled": true,
+    "filename": "${HOME}/Library/Application Support/neokikoeru/logs/neokikoeru.log",
+    "max_size": 50,
+    "max_backups": 30,
+    "max_age": 28,
+    "compress": true
+  },
+  "database": {
+    "driver": "sqlite3",
+    "data_source": "file:${HOME}/Library/Application Support/neokikoeru/neokikoeru.db?cache=shared&mode=rwc&_busy_timeout=500&_txlock=immediate&_journal_mode=WAL&_foreign_keys=true"
+  },
+  "server": {
+    "bind_host": "${bind_host}",
+    "bind_port": ${port},
+    "allow_origins": ["*"],
+    "allow_methods": ["*"],
+    "allow_headers": ["*"],
+    "jwt_secret": "neokikoeru-asmr-library",
+    "token_expires_in": 7
+  },
+  "dlsite": {
+    "locale": "zh-CN",
+    "covers_dir": "${HOME}/Library/Application Support/neokikoeru/covers",
+    "trim_outer_brackets": true,
+    "proxy_url": "",
+    "proxy_secret": ""
+  }
+}
+JSON
+}
+
+# Pull the first-run admin password out of the log if present, and persist
+# it to serve-config.json. Idempotent.
+capture_admin_password() {
+    [ -f "${LOG_FILE}" ] || return 1
+    pw="$(grep -E 'successfully created admin account.*password is \[' "${LOG_FILE}" 2>/dev/null \
+        | tail -n 1 \
+        | sed -E 's/.*password is \[([^]]*)\].*/\1/' )"
+    if [ -n "${pw}" ]; then
+        existing_user="$(read_cfg admin_user 2>/dev/null || true)"
+        existing_token="$(read_cfg token 2>/dev/null || true)"
+        write_cfg \
+            "port=$(read_cfg port 2>/dev/null || echo "${DEFAULT_PORT}")" \
+            "admin_user=${existing_user:-${DEFAULT_ADMIN_USER}}" \
+            "admin_password=${pw}" \
+            "token=${existing_token}" \
+            "token_expires_at=$(read_cfg token_expires_at 2>/dev/null || true)"
+        return 0
+    fi
+    return 1
+}
+
+running_pid() {
+    [ -f "${PID_FILE}" ] || return 1
+    pid="$(cat "${PID_FILE}" 2>/dev/null || true)"
+    [ -n "${pid}" ] || return 1
+    kill -0 "${pid}" 2>/dev/null || return 1
+    printf '%s\n' "${pid}"
+}
+
+cmd_init() {
+    port="${DEFAULT_PORT}"
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --port) port="$2" ; shift 2 ;;
+            *) fail "unknown flag: $1" ;;
+        esac
+    done
+    ensure_binary
+    write_nk_config "${port}"
+    if [ -f "${CONFIG_FILE}" ]; then
+        # Preserve existing credentials; only refresh port.
+        existing_user="$(read_cfg admin_user 2>/dev/null || true)"
+        existing_pw="$(read_cfg admin_password 2>/dev/null || true)"
+        existing_token="$(read_cfg token 2>/dev/null || true)"
+        existing_exp="$(read_cfg token_expires_at 2>/dev/null || true)"
+        write_cfg \
+            "port=${port}" \
+            "admin_user=${existing_user:-${DEFAULT_ADMIN_USER}}" \
+            "admin_password=${existing_pw}" \
+            "token=${existing_token}" \
+            "token_expires_at=${existing_exp}"
+    else
+        write_cfg \
+            "port=${port}" \
+            "admin_user=${DEFAULT_ADMIN_USER}" \
+            "admin_password=" \
+            "token=" \
+            "token_expires_at="
+    fi
+    say "Wrote Neokikoeru config -> ${NK_CONFIG} (port ${port})"
+    say "Wrote serve config    -> ${CONFIG_FILE}"
+}
+
+cmd_start() {
+    foreground=0
+    no_index=0
+    port=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --port) port="$2" ; shift 2 ;;
+            --no-index) no_index=1 ; shift ;;
+            --foreground) foreground=1 ; shift ;;
+            *) fail "unknown flag: $1" ;;
+        esac
+    done
+    ensure_binary
+    if [ -z "${port}" ]; then
+        port="$(read_cfg port 2>/dev/null || echo "${DEFAULT_PORT}")"
+    fi
+    cmd_init --port "${port}"
+    if [ "${no_index}" -eq 0 ]; then
+        [ -d "${LIBRARY_ROOT}" ] || fail "library directory missing: ${LIBRARY_ROOT} (is the TOSHIBA drive mounted?)"
+        python3 "${INDEXER}" --source "${LIBRARY_ROOT}" --index "${INDEX_ROOT}"
+    fi
+    if pid="$(running_pid)"; then
+        say "Neokikoeru already running (PID ${pid}, port ${port})"
+        return 0
+    fi
+    : > "${LOG_FILE}"
+    if [ "${foreground}" -eq 1 ]; then
+        exec "${BIN}" serve
+    fi
+    nohup "${BIN}" serve >>"${LOG_FILE}" 2>&1 &
+    echo $! > "${PID_FILE}"
+    # Give it a moment to write the first-run password line.
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+        sleep 1
+        if grep -qE 'successfully created admin account|listening on' "${LOG_FILE}" 2>/dev/null; then
+            break
+        fi
+        if ! kill -0 "$(cat "${PID_FILE}")" 2>/dev/null; then
+            break
+        fi
+    done
+    if ! running_pid >/dev/null; then
+        tail -n 30 "${LOG_FILE}" >&2
+        rm -f -- "${PID_FILE}"
+        fail "Neokikoeru exited immediately; see ${LOG_FILE}"
+    fi
+    capture_admin_password || true
+    say "Neokikoeru started (PID $(cat "${PID_FILE}"), port ${port}) -> http://localhost:${port}"
+    say "  config:     ${NK_CONFIG}"
+    say "  serve-cfg:  ${CONFIG_FILE}"
+    say "  index:      ${INDEX_ROOT}"
+    say "  log:        ${LOG_FILE}"
+    if [ -n "$(read_cfg admin_password 2>/dev/null || true)" ]; then
+        say "  admin:      ${DEFAULT_ADMIN_USER} / $(read_cfg admin_password)"
+        say "  (run: asmr-library serve status  to re-print credentials)"
+    fi
+}
+
+cmd_stop() {
+    if ! pid="$(running_pid)"; then
+        rm -f -- "${PID_FILE}"
+        say "Neokikoeru is not running"
+        return 0
+    fi
+    kill "${pid}" 2>/dev/null || true
+    for _ in 1 2 3 4 5; do
+        kill -0 "${pid}" 2>/dev/null || break
+        sleep 1
+    done
+    if kill -0 "${pid}" 2>/dev/null; then
+        kill -9 "${pid}" 2>/dev/null || true
+    fi
+    rm -f -- "${PID_FILE}"
+    say "Neokikoeru stopped (was PID ${pid})"
+}
+
+cmd_status() {
+    if pid="$(running_pid)"; then
+        port="$(read_cfg port 2>/dev/null || echo "${DEFAULT_PORT}")"
+        user="$(read_cfg admin_user 2>/dev/null || echo "${DEFAULT_ADMIN_USER}")"
+        pw="$(read_cfg admin_password 2>/dev/null || true)"
+        token="$(read_cfg token 2>/dev/null || true)"
+        exp="$(read_cfg token_expires_at 2>/dev/null || true)"
+        say "Neokikoeru is running (PID ${pid}, port ${port})"
+        say "  config:     ${NK_CONFIG}"
+        say "  index:      ${INDEX_ROOT}"
+        say "  log:        ${LOG_FILE}"
+        [ -n "${pw}" ] && say "  admin:      ${user} / ${pw}"
+        if [ -n "${token}" ]; then
+            say "  jwt:        present (expires at ${exp})"
+            say "  login url:  http://localhost:${port}/"
+        else
+            say "  jwt:        (none — run: asmr-library serve login)"
+        fi
+    else
+        say "Neokikoeru is not running"
+        return 1
+    fi
+}
+
+cmd_logs() {
+    n=40
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -n) n="$2" ; shift 2 ;;
+            *) fail "unknown flag: $1" ;;
+        esac
+    done
+    [ -f "${LOG_FILE}" ] || { say "no log file at ${LOG_FILE}"; return 0; }
+    tail -n "${n}" "${LOG_FILE}"
+}
+
+cmd_version() {
+    ensure_binary
+    "${BIN}" --version
+    [ -f "${STATE_ROOT}/neokikoeru.version" ] && cat "${STATE_ROOT}/neokikoeru.version"
+}
+
+# POST to the Neokikoeru API. Body to stdout, HTTP status to stderr.
+api_post() {
+    path="$1"
+    body="$2"
+    token="$3"
+    port="$(read_cfg port 2>/dev/null || echo "${DEFAULT_PORT}")"
+    base="http://127.0.0.1:${port}/api/v1"
+    if [ -n "${token}" ]; then
+        curl -sS -X POST -H "Content-Type: application/json" \
+             -H "Authorization: Bearer ${token}" \
+             -w '\n__HTTP_STATUS__%{http_code}\n' \
+             -d "${body}" "${base}${path}"
+    else
+        curl -sS -X POST -H "Content-Type: application/json" \
+             -w '\n__HTTP_STATUS__%{http_code}\n' \
+             -d "${body}" "${base}${path}"
+    fi
+}
+
+# GET to the Neokikoeru API. Body to stdout, HTTP status to stderr.
+api_get() {
+    path="$1"
+    token="$2"
+    port="$(read_cfg port 2>/dev/null || echo "${DEFAULT_PORT}")"
+    base="http://127.0.0.1:${port}/api/v1"
+    if [ -n "${token}" ]; then
+        curl -sS -H "Authorization: Bearer ${token}" \
+             -w '\n__HTTP_STATUS__%{http_code}\n' \
+             "${base}${path}"
+    else
+        curl -sS -w '\n__HTTP_STATUS__%{http_code}\n' \
+             "${base}${path}"
+    fi
+}
+
+cmd_login() {
+    user=""
+    pw=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --*) fail "unknown flag: $1" ;;
+            *)
+                if [ -z "${user}" ]; then user="$1"
+                elif [ -z "${pw}" ]; then pw="$1"
+                else fail "too many arguments to login"
+                fi
+                shift
+                ;;
+        esac
+    done
+    if [ -z "${user}" ]; then user="$(read_cfg admin_user 2>/dev/null || echo "${DEFAULT_ADMIN_USER}")"; fi
+    if [ -z "${pw}" ]; then pw="$(read_cfg admin_password 2>/dev/null || true)"; fi
+    [ -n "${user}" ] && [ -n "${pw}" ] || fail "no credentials available; pass USERNAME and PASSWORD"
+    if ! running_pid >/dev/null; then
+        say "WARN: Neokikoeru is not running; starting it now"
+        cmd_start --no-index
+    fi
+    pw_json="$(printf '%s' "${pw}" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()))')"
+    body="$(printf '{"username":"%s","password":%s}' "${user}" "${pw_json}")"
+    out="$(api_post /auth/login "${body}" "")"
+    status="$(printf '%s' "${out}" | grep -oE '__HTTP_STATUS__[0-9]+' | sed -E 's/.*__HTTP_STATUS__([0-9]+)/\1/')"
+    body_only="$(printf '%s' "${out}" | sed -E '/__HTTP_STATUS__[0-9]+/d')"
+    if [ "${status}" != "200" ]; then
+        printf 'Login failed (HTTP %s): %s\n' "${status}" "${body_only}" >&2
+        return 1
+    fi
+    token="$(printf '%s' "${body_only}" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("token",""))' 2>/dev/null || true)"
+    [ -n "${token}" ] || fail "no token in response: ${body_only}"
+    expires_at="$(python3 -c "import datetime; print((datetime.datetime.utcnow() + datetime.timedelta(days=6, hours=23)).strftime('%Y-%m-%dT%H:%M:%SZ'))")"
+    port="$(read_cfg port 2>/dev/null || echo "${DEFAULT_PORT}")"
+    write_cfg \
+        "port=${port}" \
+        "admin_user=${user}" \
+        "admin_password=${pw}" \
+        "token=${token}" \
+        "token_expires_at=${expires_at}"
+    say "Login OK; JWT stored in ${CONFIG_FILE} (valid through ${expires_at})"
+}
+
+cmd_storage_add() {
+    path="${INDEX_ROOT}"
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --*) fail "unknown flag: $1" ;;
+            *) path="$1" ; shift ;;
+        esac
+    done
+    [ -d "${path}" ] || fail "storage path is not a directory: ${path}"
+    token="$(read_cfg token 2>/dev/null || true)"
+    [ -n "${token}" ] || fail "no JWT — run: asmr-library serve login first"
+    body="$(python3 -c "import json,sys; print(json.dumps({'driver':'local','driver_meta':{'root_folder_path':sys.argv[1]},'max_scan_depth':3,'ignore_folders':[],'force_proxy':False,'remark':'asmr-library'}))" "${path}")"
+    out="$(api_post /admin/storages "${body}" "${token}")"
+    status="$(printf '%s' "${out}" | grep -oE '__HTTP_STATUS__[0-9]+' | sed -E 's/.*__HTTP_STATUS__([0-9]+)/\1/')"
+    body_only="$(printf '%s' "${out}" | sed -E '/__HTTP_STATUS__[0-9]+/d')"
+    if [ "${status}" != "200" ] && [ "${status}" != "201" ]; then
+        printf 'Storage add failed (HTTP %s): %s\n' "${status}" "${body_only}" >&2
+        return 1
+    fi
+    say "Storage added: ${path}"
+    say "  ${body_only}"
+    port="$(read_cfg port 2>/dev/null || echo "${DEFAULT_PORT}")"
+    say "  (open http://localhost:${port}/  and click 'scan' to start scraping)"
+}
+
+cmd_storage_list() {
+    token="$(read_cfg token 2>/dev/null || true)"
+    [ -n "${token}" ] || fail "no JWT — run: asmr-library serve login first"
+    out="$(api_get '/admin/storages?page=1&page_size=100' "${token}")"
+    status="$(printf '%s' "${out}" | grep -oE '__HTTP_STATUS__[0-9]+' | sed -E 's/.*__HTTP_STATUS__([0-9]+)/\1/')"
+    body_only="$(printf '%s' "${out}" | sed -E '/__HTTP_STATUS__[0-9]+/d')"
+    if [ "${status}" != "200" ]; then
+        printf 'Storage list failed (HTTP %s): %s\n' "${status}" "${body_only}" >&2
+        return 1
+    fi
+    printf '%s\n' "${body_only}" | python3 -m json.tool 2>/dev/null || printf '%s\n' "${body_only}"
+}
+
+# Trigger DLsite metadata scrape for a storage (async, returns task id).
+# `asmr-library serve storage scan [ID]` -- ID defaults to 1.
+cmd_storage_scan() {
+    id="${1:-1}"
+    token="$(read_cfg token 2>/dev/null || true)"
+    [ -n "${token}" ] || fail "no JWT — run: asmr-library serve login first"
+    out="$(api_post "/admin/storage/${id}/scan" '{}' "${token}")"
+    status="$(printf '%s' "${out}" | grep -oE '__HTTP_STATUS__[0-9]+' | sed -E 's/.*__HTTP_STATUS__([0-9]+)/\1/')"
+    body_only="$(printf '%s' "${out}" | sed -E '/__HTTP_STATUS__[0-9]+/d')"
+    if [ "${status}" != "200" ] && [ "${status}" != "202" ]; then
+        printf 'Storage scan failed (HTTP %s): %s\n' "${status}" "${body_only}" >&2
+        return 1
+    fi
+    say "Storage ${id} DLsite metadata scrape kicked off."
+    say "  ${body_only}"
+    task_id="$(printf '%s' "${body_only}" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('id',''))" 2>/dev/null || true)"
+    [ -n "${task_id}" ] && say "  task id: ${task_id}  -- poll: asmr-library serve tasks"
+}
+
+# Trigger filesystem re-index for a storage (async, returns task id).
+# This is what populates the `files` table so audio/subtitle downloads work.
+# `asmr-library serve storage index [ID]`
+cmd_storage_index() {
+    id="${1:-1}"
+    token="$(read_cfg token 2>/dev/null || true)"
+    [ -n "${token}" ] || fail "no JWT — run: asmr-library serve login first"
+    out="$(api_post "/admin/storage/${id}/index" '{}' "${token}")"
+    status="$(printf '%s' "${out}" | grep -oE '__HTTP_STATUS__[0-9]+' | sed -E 's/.*__HTTP_STATUS__([0-9]+)/\1/')"
+    body_only="$(printf '%s' "${out}" | sed -E '/__HTTP_STATUS__[0-9]+/d')"
+    if [ "${status}" != "200" ] && [ "${status}" != "202" ]; then
+        printf 'Storage index failed (HTTP %s): %s\n' "${status}" "${body_only}" >&2
+        return 1
+    fi
+    say "Storage ${id} filesystem re-index kicked off."
+    say "  ${body_only}"
+    task_id="$(printf '%s' "${body_only}" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('id',''))" 2>/dev/null || true)"
+    [ -n "${task_id}" ] && say "  task id: ${task_id}  -- poll: asmr-library serve tasks"
+}
+
+# Poll admin tasks.  `asmr-library serve tasks [STATUS]`
+# STATUS filters by name/state: running, done, failed, all
+cmd_tasks() {
+    token="$(read_cfg token 2>/dev/null || true)"
+    [ -n "${token}" ] || fail "no JWT — run: asmr-library serve login first"
+    out="$(api_get '/admin/tasks?page=1&page_size=20' "${token}")"
+    status="$(printf '%s' "${out}" | grep -oE '__HTTP_STATUS__[0-9]+' | sed -E 's/.*__HTTP_STATUS__([0-9]+)/\1/')"
+    body_only="$(printf '%s' "${out}" | sed -E '/__HTTP_STATUS__[0-9]+/d')"
+    if [ "${status}" != "200" ]; then
+        printf 'Tasks list failed (HTTP %s): %s\n' "${status}" "${body_only}" >&2
+        return 1
+    fi
+    printf '%s\n' "${body_only}" | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+# API may return either {\"data\": [...]} or a bare list
+if isinstance(d, dict):
+    tasks = d.get('data', d.get('tasks', []))
+elif isinstance(d, list):
+    tasks = d
+else:
+    tasks = []
+state_name = {1: 'running', 2: 'done', 3: 'failed', 4: 'cancelled'}
+for t in tasks:
+    sn = state_name.get(t.get('state', 0), '?')
+    name = t.get('name', '?')[:50]
+    prog = int(t.get('progress', 0) or 0)
+    stat = t.get('status', '')[:30]
+    err = t.get('error', '')[:40]
+    print(f'  [{t.get(\"id\",\"\")[:8]:8s}] {sn:9s} {prog:3d}%  {name:50s}  {stat}  {err}')
+" 2>&1
+}
+
+cmd_config_show() {
+    if [ -f "${CONFIG_FILE}" ]; then
+        cat "${CONFIG_FILE}"
+    else
+        say "(no serve-config.json yet — run: asmr-library serve start)"
+    fi
+}
+
+[ $# -ge 1 ] || { usage; exit 0; }
+case "$1" in
+    init)     shift; cmd_init "$@" ;;
+    start)    shift; cmd_start "$@" ;;
+    stop)     shift; cmd_stop ;;
+    status)   shift; cmd_status ;;
+    logs)     shift; cmd_logs "$@" ;;
+    version)  shift; cmd_version ;;
+    login)    shift; cmd_login "$@" ;;
+    storage)  shift
+        case "${1:-}" in
+            add)   shift; cmd_storage_add "$@" ;;
+            list)  shift; cmd_storage_list ;;
+            scan)  shift; cmd_storage_scan "$@" ;;
+            index) shift; cmd_storage_index "$@" ;;
+            *) fail "unknown storage subcommand: ${1:-} (use 'add', 'list', 'scan', or 'index')" ;;
+        esac
+        ;;
+    tasks)     shift; cmd_tasks "$@" ;;
+    config)    shift; cmd_config_show ;;
+    -h|--help|help) usage ;;
+    *) fail "unknown subcommand: $1" ;;
+esac
