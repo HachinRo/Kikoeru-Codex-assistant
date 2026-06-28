@@ -1,0 +1,852 @@
+#!/usr/bin/env python3
+"""Local operator dashboard for the ASMR library stack."""
+from __future__ import annotations
+
+import argparse
+import html
+import json
+import os
+import re
+import shutil
+import sqlite3
+import subprocess
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from uuid import uuid4
+
+HOME = Path.home()
+STATE_ROOT = Path(os.environ.get("HERMES_ASMR_HOME", str(HOME / ".hermes" / "asmr")))
+ASMR_LIBRARY = STATE_ROOT / "bin" / "asmr-library"
+ASMR_VIEW = STATE_ROOT / "bin" / "asmr-view"
+NEOKIKOERU_SERVE = STATE_ROOT / "bin" / "neokikoeru-serve"
+LIBRARY_ROOT = Path(os.environ.get("ASMR_LIBRARY_ROOT", str(Path.home() / "ASMR")))
+NEOKIKOERU_DB = HOME / "Library" / "Application Support" / "neokikoeru" / "neokikoeru.db"
+NEOKIKOERU_COVERS = HOME / "Library" / "Application Support" / "neokikoeru" / "covers" / "doujin"
+ASMRONER_DB = STATE_ROOT / ".asmroner-data" / "asmroner.db"
+SUB_EXTS = {".lrc", ".vtt", ".srt", ".ass", ".ssa"}
+AUDIO_EXTS = {".mp3", ".wav", ".flac", ".m4a", ".aac", ".ogg", ".opus"}
+ASMR_TRACK_API_BASES = ("https://api.asmr.one", "https://api.asmr-200.com", "https://api.asmr-300.com")
+RJ_RE = re.compile(r"^RJ\d+$", re.I)
+
+actions: dict[str, dict] = {}
+actions_lock = threading.Lock()
+track_count_cache: dict[str, tuple[int | None, int]] = {}
+
+
+def now_ms() -> int:
+    return int(time.time() * 1000)
+
+
+def rj_arg(value: str) -> str:
+    rj = (value or "").strip().upper()
+    if not RJ_RE.match(rj):
+        raise ValueError("RJ must look like RJ01234567")
+    return rj
+
+
+def db_connect() -> sqlite3.Connection | None:
+    if not NEOKIKOERU_DB.exists():
+        return None
+    conn = sqlite3.connect(str(NEOKIKOERU_DB))
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def http_status(url: str, timeout: float = 3.0) -> dict:
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as r:
+            body = r.read(256)
+            return {"ok": 200 <= r.status < 400, "status": r.status, "body": body.decode("utf-8", "ignore")}
+    except Exception as e:
+        return {"ok": False, "status": None, "error": str(e)}
+
+
+def run_capture(argv: list[str], timeout: int = 120) -> dict:
+    started = now_ms()
+    try:
+        p = subprocess.run(
+            argv,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=timeout,
+            cwd=str(STATE_ROOT),
+            env={
+                **os.environ,
+                "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+            },
+        )
+        return {
+            "argv": argv,
+            "exit_code": p.returncode,
+            "ok": p.returncode == 0,
+            "output": p.stdout[-20000:],
+            "started_at": started,
+            "finished_at": now_ms(),
+        }
+    except subprocess.TimeoutExpired as e:
+        return {
+            "argv": argv,
+            "exit_code": 124,
+            "ok": False,
+            "output": ((e.stdout or "") + (e.stderr or ""))[-20000:],
+            "error": f"timed out after {timeout}s",
+            "started_at": started,
+            "finished_at": now_ms(),
+        }
+    except Exception as e:
+        return {
+            "argv": argv,
+            "exit_code": 1,
+            "ok": False,
+            "output": "",
+            "error": str(e),
+            "started_at": started,
+            "finished_at": now_ms(),
+        }
+
+
+def queue_action(name: str, argv: list[str], timeout: int = 600) -> dict:
+    action_id = uuid4().hex[:12]
+    record = {
+        "id": action_id,
+        "name": name,
+        "argv": argv,
+        "status": "running",
+        "started_at": now_ms(),
+        "finished_at": None,
+        "exit_code": None,
+        "output": "",
+    }
+    record["progress"] = action_progress(record)
+    with actions_lock:
+        actions[action_id] = record
+
+    def worker() -> None:
+        result = run_capture(argv, timeout=timeout)
+        with actions_lock:
+            record.update(result)
+            record["status"] = "done" if result["ok"] else "failed"
+            record["progress"] = action_progress(record)
+
+    threading.Thread(target=worker, daemon=True).start()
+    return record
+
+
+def _action_rjs(record: dict) -> list[str]:
+    seen: list[str] = []
+    for arg in record.get("argv") or []:
+        if isinstance(arg, str) and RJ_RE.match(arg) and arg.upper() not in seen:
+            seen.append(arg.upper())
+    return seen
+
+
+def _relative_db_path(rj: str, db_path: str) -> Path:
+    clean = (db_path or "").lstrip("/")
+    if clean.upper().startswith(rj.upper() + "/"):
+        clean = clean[len(rj) + 1 :]
+    return Path(clean)
+
+
+def _existing_relative_files(root: Path, rj: str) -> set[str]:
+    if not root.is_dir():
+        return set()
+    base = root
+    children = [p for p in root.iterdir() if p.is_dir()] if root.exists() else []
+    if root.name == f"{rj}.partial" and len(children) == 1:
+        base = children[0]
+    out: set[str] = set()
+    for p in base.rglob("*"):
+        if p.is_file() and not p.name.startswith("."):
+            try:
+                out.add(str(p.relative_to(base)))
+            except ValueError:
+                out.add(p.name)
+    return out
+
+
+def _expected_audio_count_from_log(rj: str) -> int | None:
+    log_path = STATE_ROOT / "logs" / f"{rj}.log"
+    if not log_path.exists():
+        return None
+    try:
+        text = log_path.read_text(errors="ignore")[-20000:]
+    except OSError:
+        return None
+    matches = re.findall(r"(?:音轨数|tracks?|audio tracks?)[:：]\s*(\d+)", text, flags=re.I)
+    if not matches:
+        return None
+    try:
+        return int(matches[-1])
+    except ValueError:
+        return None
+
+
+def _count_audio(paths: set[str]) -> int:
+    return sum(1 for p in paths if Path(p).suffix.lower() in AUDIO_EXTS)
+
+
+def _count_track_leaves(nodes: list[dict]) -> int:
+    total = 0
+    for node in nodes or []:
+        children = node.get("children") if isinstance(node, dict) else None
+        if children:
+            total += _count_track_leaves(children)
+        else:
+            total += 1
+    return total
+
+
+def _expected_file_count_from_tracks_api(rj: str) -> int | None:
+    cached = track_count_cache.get(rj)
+    now = now_ms()
+    if cached and now - cached[1] < 30 * 60 * 1000:
+        return cached[0]
+    try:
+        work_number = str(int(rj[2:]))
+    except (TypeError, ValueError):
+        return None
+    for base in ASMR_TRACK_API_BASES:
+        url = f"{base}/api/tracks/{work_number}"
+        req = urllib.request.Request(
+            url,
+            headers={"Accept": "application/json", "User-Agent": "Mozilla/5.0"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=6) as resp:
+                data = json.loads(resp.read().decode("utf-8", "ignore"))
+        except (OSError, TimeoutError, json.JSONDecodeError, urllib.error.URLError):
+            continue
+        if isinstance(data, list):
+            count = _count_track_leaves(data)
+            if count:
+                track_count_cache[rj] = (count, now)
+                return count
+    track_count_cache[rj] = (None, now)
+    return None
+
+
+def _work_progress(rj: str, status: str = "running") -> dict:
+    info = work_info(rj)
+    expected_files = [
+        f for f in info.get("db_files", [])
+        if not f.get("is_folder") and f.get("path")
+    ]
+    expected_rel = {str(_relative_db_path(rj, f["path"])) for f in expected_files}
+
+    final_root = LIBRARY_ROOT / rj
+    stage_root = LIBRARY_ROOT.parent / "AMSR.incoming" / f"{rj}.partial"
+    final_files = _existing_relative_files(final_root, rj)
+    stage_files = _existing_relative_files(stage_root, rj)
+    existing_rel = final_files | stage_files
+
+    if info.get("folder_exists") and existing_rel:
+        missing = []
+        downloaded = len(existing_rel)
+        total = len(existing_rel)
+        expected_source = "work-files"
+        count_unit = "files"
+        missing_count = 0
+    elif expected_rel:
+        missing = sorted(expected_rel - existing_rel)
+        downloaded = len(expected_rel) - len(missing)
+        total = len(expected_rel)
+        expected_source = "db"
+        count_unit = "files"
+        missing_count = len(missing)
+    else:
+        expected_track_files = _expected_file_count_from_tracks_api(rj)
+        if expected_track_files:
+            missing = []
+            downloaded = min(len(existing_rel), expected_track_files)
+            total = expected_track_files
+            expected_source = "tracks-api"
+            count_unit = "files"
+            missing_count = max(total - downloaded, 0)
+        elif existing_rel:
+            missing = []
+            downloaded = len(existing_rel)
+            total = len(existing_rel)
+            expected_source = "staging-files" if stage_files else "work-files"
+            count_unit = "files"
+            missing_count = 0
+        else:
+            expected_audio = _expected_audio_count_from_log(rj)
+            missing = []
+            if expected_audio:
+                downloaded = min(_count_audio(existing_rel), expected_audio)
+                total = expected_audio
+                expected_source = "log-audio"
+                count_unit = "audio tracks"
+                missing_count = max(total - downloaded, 0)
+            else:
+                downloaded = len(existing_rel)
+                total = None
+                expected_source = "unknown"
+                count_unit = "files"
+                missing_count = None
+
+    if info.get("folder_exists") and existing_rel:
+        percent = 100
+    elif total:
+        percent = round(downloaded * 100 / total)
+        if status == "running" and percent >= 100:
+            percent = 99
+    elif status == "done" and info.get("folder_exists"):
+        percent = 100
+    else:
+        percent = None
+    return {
+        "rj": rj,
+        "title": (info.get("db_work") or {}).get("name") or "",
+        "folder_exists": info.get("folder_exists", False),
+        "db_work": bool(info.get("db_work")),
+        "downloaded_files": downloaded,
+        "expected_files": total,
+        "expected_source": expected_source,
+        "count_unit": count_unit,
+        "missing_files": missing[:200],
+        "missing_file_count": missing_count,
+        "audio_files": info.get("audio_files", 0),
+        "subtitle_files": info.get("subtitle_files", 0),
+        "stage_files": len(stage_files),
+        "final_files": len(final_files),
+        "percent": percent,
+    }
+
+
+def action_progress(record: dict) -> dict:
+    rjs = _action_rjs(record)
+    status = record.get("status") or "running"
+    works = [_work_progress(rj, status=status) for rj in rjs]
+    if works:
+        known_totals = [w["expected_files"] for w in works if w.get("expected_files") is not None]
+        total = sum(known_totals) if len(known_totals) == len(works) else None
+        downloaded = sum(w["downloaded_files"] for w in works)
+        missing_values = [w["missing_file_count"] for w in works if w.get("missing_file_count") is not None]
+        missing = sum(missing_values) if len(missing_values) == len(works) else None
+        units = {w.get("count_unit") or "files" for w in works}
+        count_unit = units.pop() if len(units) == 1 else "items"
+        if total:
+            percent = round(downloaded * 100 / total)
+            if all(w.get("percent") == 100 for w in works):
+                percent = 100
+            elif status == "running" and percent >= 100:
+                percent = 99
+        elif status == "done":
+            percent = 100
+        else:
+            percent = None
+    else:
+        summary = library_summary()
+        total = summary.get("library_works") or 0
+        downloaded = total
+        missing = summary.get("missing_subtitle_count") or 0
+        count_unit = "works"
+        percent = 100 if status == "done" else None
+    return {
+        "percent": percent,
+        "downloaded_files": downloaded,
+        "expected_files": total,
+        "count_unit": count_unit,
+        "missing_count": missing,
+        "works": works,
+        "updated_at": now_ms(),
+    }
+
+
+def action_snapshot(action_id: str) -> dict | None:
+    with actions_lock:
+        record = actions.get(action_id)
+        if not record:
+            return None
+        record["progress"] = action_progress(record)
+        return dict(record)
+
+
+def action_list() -> list[dict]:
+    with actions_lock:
+        items = list(actions.values())[-25:]
+        for record in items:
+            record["progress"] = action_progress(record)
+        return [dict(record) for record in reversed(items)]
+
+
+def library_summary() -> dict:
+    library_dirs = []
+    missing_subs = []
+    total_audio = 0
+    total_subs = 0
+    if LIBRARY_ROOT.is_dir():
+        for p in sorted(LIBRARY_ROOT.iterdir()):
+            if not p.is_dir() or not RJ_RE.match(p.name):
+                continue
+            has_audio = False
+            has_sub = False
+            for f in p.rglob("*"):
+                if not f.is_file():
+                    continue
+                suffix = f.suffix.lower()
+                if suffix in AUDIO_EXTS:
+                    has_audio = True
+                    total_audio += 1
+                if suffix in SUB_EXTS:
+                    has_sub = True
+                    total_subs += 1
+            library_dirs.append(p.name)
+            if has_audio and not has_sub:
+                missing_subs.append(p.name)
+
+    db_works = None
+    db_files = None
+    conn = db_connect()
+    if conn:
+        try:
+            db_works = conn.execute("SELECT COUNT(*) FROM works").fetchone()[0]
+            db_files = conn.execute("SELECT COUNT(*) FROM files WHERE is_folder = 0").fetchone()[0]
+        finally:
+            conn.close()
+
+    covers = 0
+    if NEOKIKOERU_COVERS.is_dir():
+        covers = sum(1 for f in NEOKIKOERU_COVERS.rglob("*") if f.is_file())
+
+    failed_sync = 0
+    err_log = STATE_ROOT / ".asmroner-data" / "download_errors.log"
+    if err_log.exists():
+        try:
+            failed_sync = sum(1 for line in err_log.read_text(errors="ignore").splitlines() if line.strip())
+        except OSError:
+            failed_sync = -1
+
+    return {
+        "library_root": str(LIBRARY_ROOT),
+        "library_mounted": LIBRARY_ROOT.is_dir(),
+        "library_works": len(library_dirs),
+        "db_works": db_works,
+        "db_files": db_files,
+        "covers": covers,
+        "audio_files": total_audio,
+        "subtitle_files": total_subs,
+        "missing_subtitle_count": len(missing_subs),
+        "missing_subtitles": missing_subs,
+        "asmroner_failed_records": failed_sync,
+    }
+
+
+def health() -> dict:
+    viewer = run_capture([str(ASMR_VIEW), "status"], timeout=10) if ASMR_VIEW.exists() else {"ok": False, "output": "asmr-view missing"}
+    summary = library_summary()
+    services = {
+        "ASMR viewer": http_status("http://127.0.0.1:8890/api/health"),
+        "ASMR storage": {
+            "ok": bool(summary["library_mounted"]),
+            "status": str(LIBRARY_ROOT),
+        },
+        "NeoKikoeru DB": {
+            "ok": summary["db_works"] is not None,
+            "status": f"{summary['db_works'] or 0} works",
+        },
+    }
+    ok = all(v["ok"] for v in services.values())
+    return {"ok": ok, "services": services, "viewer_status": viewer, "summary": summary}
+
+
+def work_info(rj_raw: str) -> dict:
+    rj = rj_arg(rj_raw)
+    folder = LIBRARY_ROOT / rj
+    out = {
+        "rj": rj,
+        "folder": str(folder),
+        "folder_exists": folder.is_dir(),
+        "audio_files": 0,
+        "subtitle_files": 0,
+        "image_files": 0,
+        "db_work": None,
+        "db_files": [],
+    }
+    if folder.is_dir():
+        for f in folder.rglob("*"):
+            if not f.is_file():
+                continue
+            suffix = f.suffix.lower()
+            if suffix in AUDIO_EXTS:
+                out["audio_files"] += 1
+            elif suffix in SUB_EXTS:
+                out["subtitle_files"] += 1
+            elif suffix in {".jpg", ".jpeg", ".png", ".webp", ".gif"}:
+                out["image_files"] += 1
+
+    conn = db_connect()
+    if conn:
+        try:
+            row = conn.execute("SELECT id, name, rating, rating_count, sales, price, age_category FROM works WHERE id = ?", (rj,)).fetchone()
+            if row:
+                out["db_work"] = dict(row)
+            rows = conn.execute(
+                "SELECT id, name, path, size, duration, is_folder FROM files WHERE work_id = ? ORDER BY is_folder DESC, path",
+                (rj,),
+            ).fetchall()
+            out["db_files"] = [dict(x) for x in rows]
+        finally:
+            conn.close()
+    return out
+
+
+INDEX_HTML = r"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ASMR Library Dashboard</title>
+  <style>
+:root {
+  color-scheme: dark;
+  --bg:#0d1017; --panel:#171c26; --panel-2:#101521; --muted:#9aa4b2;
+  --ok:#46d369; --bad:#ff6b6b; --line:#2a3242; --text:#eef3fb; --accent:#75a7ff;
+}
+* { box-sizing:border-box; }
+body { margin:0; font:14px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; background:var(--bg); color:var(--text); }
+header { padding:16px 22px; border-bottom:1px solid var(--line); display:flex; justify-content:space-between; align-items:center; background:#121722; }
+h1 { margin:0; font-size:19px; font-weight:700; }
+h2 { margin:0 0 14px; font-size:15px; font-weight:700; }
+main { padding:18px 22px; display:grid; grid-template-columns:repeat(auto-fit,minmax(330px,1fr)); gap:16px; align-items:start; }
+section { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:16px; min-height:0; }
+button,input { border-radius:7px; border:1px solid var(--line); background:var(--panel-2); color:var(--text); padding:8px 10px; font:inherit; }
+button { cursor:pointer; background:#1d2940; font-weight:650; min-height:34px; white-space:normal; overflow-wrap:anywhere; }
+button:hover { background:#243554; }
+button.primary { background:#24416d; border-color:#34598f; }
+button.primary:hover { background:#2b4d80; }
+button.ghost { background:#111827; }
+.grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:10px; }
+.stat { padding:10px; background:var(--panel-2); border-radius:8px; min-height:64px; }
+.label { color:var(--muted); font-size:12px; }
+.value { font-size:22px; font-weight:750; margin-top:4px; }
+.ok { color:var(--ok); } .bad { color:var(--bad); }
+.bar { height:10px; background:#0b0f18; border:1px solid var(--line); border-radius:999px; overflow:hidden; margin:8px 0; }
+.bar > i { display:block; height:100%; background:linear-gradient(90deg,#75a7ff,#46d369); width:0%; transition:width .25s ease; }
+.progress-meta { display:flex; justify-content:space-between; gap:12px; color:var(--muted); font-size:12px; }
+details.missing { margin-top:8px; }
+pre { max-height:360px; overflow:auto; white-space:pre-wrap; background:#090c12; border:1px solid var(--line); border-radius:8px; padding:12px; }
+table { width:100%; border-collapse:collapse; }
+td,th { text-align:left; padding:6px; border-bottom:1px solid var(--line); }
+.row { display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin:8px 0; }
+.health-actions { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:8px; margin-top:12px; }
+.work-panel { display:flex; flex-direction:column; gap:12px; }
+.work-field { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:8px; align-items:center; }
+.admin-auth { display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1fr) auto; gap:8px; align-items:center; }
+.admin-actions { display:grid; grid-template-columns:repeat(2,auto); gap:8px; }
+.auth-status { min-height:16px; }
+.panel-subhead { color:var(--muted); font-size:12px; font-weight:700; margin:2px 0 -2px; text-transform:uppercase; }
+.action-strip { display:grid; grid-template-columns:repeat(auto-fit,minmax(92px,1fr)); gap:8px; align-items:center; }
+.action-strip button { min-width:0; }
+a { color:var(--accent); }
+@media (max-width:700px) {
+  main { padding:14px; grid-template-columns:1fr; }
+  .health-actions, .action-strip, .admin-auth { grid-template-columns:1fr; }
+  .admin-actions { grid-template-columns:repeat(2,minmax(0,1fr)); }
+  .work-field { grid-template-columns:1fr; }
+}
+</style>
+</head>
+<body>
+<header><h1>ASMR Library Dashboard</h1><div id="stamp" class="label"></div></header>
+<main>
+<section><h2>Stack health</h2><div id="health">Loading…</div><div class="health-actions"><button onclick="action('fix-covers')">Fix missing cover</button><button onclick="action('reindex')">Reindex metadata</button></div></section>
+  <section><h2>Library summary</h2><div id="summary">Loading…</div></section>
+<section><h2>Work actions</h2>
+<div class="work-panel">
+ <div class="work-field">
+  <input id="rj" placeholder="RJ01234567" autocomplete="off">
+  <button class="primary" onclick="lookup()">Lookup</button>
+ </div>
+ <div class="panel-subhead">Admin session</div>
+ <div class="admin-auth">
+  <input id="admin-user" autocomplete="username" placeholder="Username" value="admin">
+  <input id="admin-pass" autocomplete="current-password" placeholder="Password" type="password">
+  <div class="admin-actions">
+   <button onclick="saveAdminAuth()">Save</button>
+   <button class="ghost" onclick="clearAdminAuth()">Clear</button>
+  </div>
+ </div>
+ <div id="admin-auth-status" class="label auth-status"></div>
+ <div class="panel-subhead">RJ actions</div>
+ <div class="action-strip">
+  <button class="primary" onclick="action('download')">Download</button>
+  <button onclick="action('retry')">Retry</button>
+  <button onclick="action('fill')">Fill</button>
+  <button onclick="action('subs-fetch')">Fetch subs</button>
+ </div>
+ <div id="work"></div>
+</div>
+</section>
+<section><h2>Missing subtitles</h2><div id="missing">Loading…</div></section>
+  <section style="grid-column:1/-1"><h2>Action output</h2><div id="actions"></div></section>
+</main>
+<script>
+let active = new Set();
+const protectedActions = new Set(['download', 'fill']);
+const adminAuthKey = 'asmrAdminBasicAuth';
+async function api(path, opts={}) {
+ const r = await fetch(path, opts);
+ const j = await r.json();
+ if (!r.ok) {
+  const err = new Error(j.error || r.statusText);
+  err.status = r.status;
+  throw err;
+ }
+ return j;
+}
+function getAdminAuth(){ return sessionStorage.getItem(adminAuthKey) || ''; }
+function setAdminAuth(user, pass){ sessionStorage.setItem(adminAuthKey, 'Basic '+btoa(`${user}:${pass}`)); updateAdminAuthStatus(); }
+function updateAdminAuthStatus(){
+ const el = document.getElementById('admin-auth-status');
+ if(el) el.textContent = getAdminAuth() ? 'saved for session' : 'not saved';
+}
+function saveAdminAuth(){
+ const user = document.getElementById('admin-user')?.value || 'admin';
+ const pass = document.getElementById('admin-pass')?.value || '';
+ if(!pass){ alert('Enter the admin password first.'); return false; }
+ setAdminAuth(user, pass);
+ return true;
+}
+function clearAdminAuth(){
+ sessionStorage.removeItem(adminAuthKey);
+ const pass = document.getElementById('admin-pass');
+ if(pass) pass.value = '';
+ updateAdminAuthStatus();
+}
+function requestAdminAuth(){
+ return new Promise(resolve => {
+  const existing = document.getElementById('admin-auth-modal');
+  if(existing) existing.remove();
+  const modal = document.createElement('div');
+  modal.id = 'admin-auth-modal';
+  modal.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.55);display:grid;place-items:center;z-index:20;';
+  modal.innerHTML = `<form style="width:min(360px,calc(100vw - 32px));background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:16px;box-shadow:0 20px 60px rgba(0,0,0,.35)">
+   <h2>Admin credentials</h2>
+   <div class="row"><input name="user" autocomplete="username" placeholder="Username" value="admin" style="width:100%"></div>
+   <div class="row"><input name="pass" autocomplete="current-password" placeholder="Password" type="password" style="width:100%"></div>
+   <div class="row"><button type="submit">Continue</button><button type="button" data-cancel>Cancel</button></div>
+  </form>`;
+  document.body.appendChild(modal);
+  const form = modal.querySelector('form');
+  const pass = modal.querySelector('input[name=pass]');
+  pass.focus();
+  modal.querySelector('[data-cancel]').onclick = () => { modal.remove(); resolve(false); };
+  form.onsubmit = e => {
+   e.preventDefault();
+   setAdminAuth(form.user.value || 'admin', form.pass.value || '');
+   modal.remove();
+   resolve(true);
+  };
+ });
+}
+function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+function stat(label, value, cls=''){return `<div class="stat"><div class="label">${esc(label)}</div><div class="value ${cls}">${esc(value)}</div></div>`}
+async function refresh(){
+  const h = await api('/api/health');
+  document.getElementById('stamp').textContent = new Date().toLocaleString();
+  document.getElementById('health').innerHTML = Object.entries(h.services).map(([k,v]) =>
+    `<div>${esc(k)}: <span class="${v.ok?'ok':'bad'}">${v.ok?'OK':'FAIL'}</span> ${esc(v.status||v.error||'')}</div>`).join('') +
+    `<pre>${esc(h.viewer_status.output || h.viewer_status.error || '')}</pre>`;
+  const s = h.summary;
+  document.getElementById('summary').innerHTML = `<div class="grid">`+
+    stat('Library works', s.library_works) + stat('DB works', s.db_works ?? '-') +
+    stat('Covers', s.covers) + stat('Missing subs', s.missing_subtitle_count, s.missing_subtitle_count ? 'bad' : 'ok') +
+    stat('Audio files', s.audio_files) + stat('Subtitle files', s.subtitle_files) + `</div>`+
+    `<p class="label">${esc(s.library_root)}</p>`;
+  document.getElementById('missing').innerHTML = s.missing_subtitles.length
+    ? `<pre>${esc(s.missing_subtitles.join('\n'))}</pre>` : '<span class="ok">No missing subtitles</span>';
+}
+async function lookup(){
+  const rj = document.getElementById('rj').value.trim();
+  const w = await api('/api/work/'+encodeURIComponent(rj));
+  document.getElementById('work').innerHTML = `<div class="grid">`+
+    stat('Folder', w.folder_exists?'yes':'no', w.folder_exists?'ok':'bad')+
+    stat('DB row', w.db_work?'yes':'no', w.db_work?'ok':'bad')+
+    stat('Audio', w.audio_files)+stat('Subs', w.subtitle_files)+`</div>`+
+    `<p>${esc(w.db_work?.name || '')}</p>`+
+    `<pre>${esc(w.db_files.slice(0,80).map(f => (f.is_folder?'[dir] ':'      ')+f.path).join('\n'))}</pre>`;
+}
+async function action(name){
+  const needsRj = !['reindex','fix-covers'].includes(name);
+  const body = needsRj ? {rj: document.getElementById('rj').value.trim()} : (name === 'fix-covers' ? {rj: document.getElementById('rj').value.trim()} : {});
+ const headers = {'Content-Type':'application/json'};
+ if(protectedActions.has(name) && !getAdminAuth()){
+  const pass = document.getElementById('admin-pass')?.value || '';
+  if(pass) saveAdminAuth();
+ }
+ if(protectedActions.has(name) && getAdminAuth()) headers.Authorization = getAdminAuth();
+ let rec;
+ try {
+  rec = await api('/api/actions/'+name, {method:'POST', headers, body:JSON.stringify(body)});
+ } catch(e) {
+  if(e.status === 401 && protectedActions.has(name) && await requestAdminAuth()) {
+   headers.Authorization = getAdminAuth();
+   rec = await api('/api/actions/'+name, {method:'POST', headers, body:JSON.stringify(body)});
+  } else {
+   throw e;
+  }
+ }
+ active.add(rec.id);
+ renderAction(rec);
+ poll();
+}
+updateAdminAuthStatus();
+function renderProgress(p){
+ if(!p) return '';
+ const pctKnown = p.percent !== null && p.percent !== undefined;
+ const pct = pctKnown ? Math.max(0, Math.min(100, Number(p.percent || 0))) : 0;
+ const pctLabel = pctKnown ? `${pct}%` : 'working';
+ const missingLabel = p.missing_count ?? '?';
+ const unit = p.count_unit || 'files';
+ let html = `<div class="bar"><i style="width:${pct}%"></i></div>`+
+ `<div class="progress-meta"><span>${pctLabel}</span><span>${esc(p.downloaded_files ?? 0)} / ${esc(p.expected_files ?? '?')} ${esc(unit)}</span><span>${esc(missingLabel)} missing</span></div>`;
+ if((p.works||[]).length){
+ html += (p.works||[]).map(w => {
+ const wpKnown = w.percent !== null && w.percent !== undefined;
+ const wp = wpKnown ? Math.max(0, Math.min(100, Number(w.percent || 0))) : 0;
+ const wpLabel = wpKnown ? `${wp}%` : 'working';
+ const source = w.expected_source ? ` · total from ${esc(w.expected_source)}` : '';
+ const wunit = w.count_unit || 'files';
+ const missing = (w.missing_files||[]).length
+ ? `<details class="missing"><summary>${esc(w.missing_file_count)} missing file(s)</summary><pre>${esc((w.missing_files||[]).join('\n'))}</pre></details>`
+ : '';
+ return `<div class="stat"><strong>${esc(w.rj)}</strong> ${esc(w.title||'')}`+
+ `<div class="bar"><i style="width:${wp}%"></i></div>`+
+ `<div class="progress-meta"><span>${wpLabel}</span><span>${esc(w.downloaded_files)} / ${esc(w.expected_files ?? '?')} ${esc(wunit)}</span><span>${esc(w.audio_files)} audio · ${esc(w.subtitle_files)} subs</span></div>`+
+ `<div class="label">final ${esc(w.final_files)} · staging ${esc(w.stage_files)} · folder ${w.folder_exists?'yes':'no'} · DB ${w.db_work?'yes':'no'}${source}</div>`+
+ missing + `</div>`;
+ }).join('');
+ }
+ return html;
+}
+function renderAction(a){
+ let el = document.getElementById('act-'+a.id);
+ if(!el){ el = document.createElement('div'); el.id='act-'+a.id; document.getElementById('actions').prepend(el); }
+ el.innerHTML = `<h3>${esc(a.name)} <span class="${a.status==='done'?'ok':a.status==='failed'?'bad':''}">${esc(a.status)}</span></h3>`+
+ `<div class="label">${esc((a.argv||[]).join(' '))}</div>`+
+ renderProgress(a.progress)+
+ `<pre>${esc(a.output || a.error || '')}</pre>`;
+}
+async function poll(){
+  for(const id of Array.from(active)){
+    const a = await api('/api/actions/'+id);
+    renderAction(a);
+    if(a.status !== 'running') active.delete(id);
+  }
+  if(active.size) setTimeout(poll, 1500);
+}
+refresh().catch(e => document.body.insertAdjacentHTML('beforeend','<pre>'+esc(e.message)+'</pre>'));
+</script>
+</body>
+</html>
+"""
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "asmr-dashboard/1.0"
+
+    def log_message(self, fmt: str, *args) -> None:
+        print("%s - %s" % (self.address_string(), fmt % args), flush=True)
+
+    def send_json(self, data, status=HTTPStatus.OK) -> None:
+        body = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def send_html(self, body: str) -> None:
+        raw = body.encode("utf-8")
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def read_json(self) -> dict:
+        n = int(self.headers.get("Content-Length", "0") or 0)
+        if n <= 0:
+            return {}
+        return json.loads(self.rfile.read(n).decode("utf-8"))
+
+    def do_GET(self) -> None:
+        try:
+            path = urllib.parse.urlparse(self.path).path
+            if path in ("/", "/index.html"):
+                return self.send_html(INDEX_HTML)
+            if path == "/api/health":
+                return self.send_json(health())
+            if path == "/api/library/summary":
+                return self.send_json(library_summary())
+            if path == "/api/subtitles/missing":
+                return self.send_json({"items": library_summary()["missing_subtitles"]})
+            if path.startswith("/api/work/"):
+                rj = urllib.parse.unquote(path.rsplit("/", 1)[-1])
+                return self.send_json(work_info(rj))
+            if path.startswith("/api/actions/"):
+                action_id = path.rsplit("/", 1)[-1]
+                rec = action_snapshot(action_id)
+                if not rec:
+                    return self.send_json({"error": "action not found"}, HTTPStatus.NOT_FOUND)
+                return self.send_json(rec)
+            return self.send_json({"error": "not found"}, HTTPStatus.NOT_FOUND)
+        except Exception as e:
+            return self.send_json({"error": str(e)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+
+    def do_POST(self) -> None:
+        try:
+            path = urllib.parse.urlparse(self.path).path
+            if not path.startswith("/api/actions/"):
+                return self.send_json({"error": "not found"}, HTTPStatus.NOT_FOUND)
+            name = path.rsplit("/", 1)[-1]
+            body = self.read_json()
+            if name == "fix-covers":
+                sample_rj = rj_arg(body.get("rj", "RJ01580504") or "RJ01580504")
+                rec = queue_action("fix-covers", [str(STATE_ROOT / "bin" / "asmr-fix-covers-workflow"), sample_rj], timeout=1800)
+            elif name == "reindex":
+                rec = queue_action("reindex", [str(ASMR_LIBRARY), "reindex"], timeout=1800)
+            else:
+                rj = rj_arg(body.get("rj", ""))
+                mapping = {
+                    "download": [str(ASMR_LIBRARY), "download", rj],
+                    "retry": [str(ASMR_LIBRARY), "retry", rj],
+                    "fill": [str(ASMR_LIBRARY), "fill", rj],
+                    "fix-content": [str(STATE_ROOT / "bin" / "asmr-fix-content-workflow"), rj],
+                    "subs-dry-run": [str(ASMR_LIBRARY), "subs", "fetch", rj, "--dry-run"],
+                    "subs-fetch": [str(ASMR_LIBRARY), "subs", "fetch", rj],
+                }
+                if name not in mapping:
+                    return self.send_json({"error": "unknown action"}, HTTPStatus.NOT_FOUND)
+                rec = queue_action(name, mapping[name], timeout=1800)
+            return self.send_json(rec, HTTPStatus.ACCEPTED)
+        except Exception as e:
+            return self.send_json({"error": str(e)}, HTTPStatus.BAD_REQUEST)
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description="ASMR library operator dashboard")
+    ap.add_argument("--host", default=os.environ.get("ASMR_DASHBOARD_HOST", "127.0.0.1"))
+    ap.add_argument("--port", type=int, default=int(os.environ.get("ASMR_DASHBOARD_PORT", "8891")))
+    args = ap.parse_args()
+    if not ASMR_LIBRARY.exists():
+        raise SystemExit(f"asmr-library not found: {ASMR_LIBRARY}")
+    httpd = ThreadingHTTPServer((args.host, args.port), Handler)
+    print(f"ASMR dashboard listening on http://{args.host}:{args.port}", flush=True)
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        print("\nASMR dashboard stopped", flush=True)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,856 @@
+#!/usr/bin/env python3
+"""asmr-subs: fetch Chinese subtitles from asmr.one into ASMR_LIBRARY_ROOT (default ~/ASMR).
+
+Usage:
+  asmr-subs login <name> <password>      # one-time, persists session cookie
+  asmr-subs check RJ01234567 [RJ...]     # report has_subtitle + sibling editions
+  asmr-subs fetch RJ01234567 [RJ...]     # download subs to library, GB2312 -> UTF-8
+  asmr-subs list-missing                 # scan library, list RJs with no on-disk subs
+  asmr-subs fetch-missing [RJ...]        # fetch for all RJs in library that have no on-disk subs
+
+Cross-edition subtitle fetching (the main use case)
+---------------------------------------------------
+
+Many works on asmr.one exist as multiple RJs (one per language edition):
+the original Japanese RJ plus translation RJs (CHI_HANS = 简体中文,
+CHI_HANT = 繁体中文, ENG, etc.). Only the translation RJs typically have
+Chinese subtitles. The fetcher automatically:
+
+  1. Looks up the workInfo for the given RJ to discover sibling editions
+     via `language_editions` and `other_language_editions_in_db`.
+  2. For each candidate sibling, asks asmr.one whether it actually exists
+     and has `has_subtitle=True`.
+  3. Picks the best sub-having sibling by language priority:
+     CHI_HANS > CHI_HANT > JPN (the original).
+     If none of the siblings have subs, falls back to the input RJ itself
+     (handles the case where the user pointed at a translation directly).
+  4. Fetches the chosen sibling's track tree, then for each sub leaf:
+       - records the sub's **group** (asmr-one folder path, e.g.
+         `01_正篇mp3/`) and **position** (sorted order within the group)
+       - records the sub's download URL and original sub filename
+  5. Walks the user's local `rj_dir`, groups audio files by their
+     immediate parent directory (e.g. `01_本編mp3/`), and sorts each
+     group's audio by filename.
+  6. Pairs sub groups with audio groups by (a) equal size first, then
+     (b) the sub-having group's position in its top-level version folder.
+     (The asmr-one convention is main first, then no-SE/差分, then 特典 —
+     which is also the user's on-disk convention. Pair largest groups
+     first to handle ties.)
+  7. Within a paired (sub-group, audio-group) tuple, pairs entries by
+     position. The output subtitle is renamed to the **local audio's
+     filename** plus the subtitle extension, e.g. an asmr-one sub titled
+     `Tr_01_H_序章_SS級製作人適應性測試開始.mp3.vtt` is written as
+     `<local-audio-dir>/Tr_01_プロローグ_SS級プロデューサー適性検査開始.mp3.vtt`.
+
+Filename-equal sub matching is kept as a fast path for the case where
+asmr-one's sub title happens to match the local audio filename (e.g.
+the user downloaded the same edition as the sub-having RJ). That happens
+when the user has the translation edition on disk rather than the
+original.
+
+Encoding: asmr.one serves subtitle files as text/plain; charset=GB2312.
+Decoded as GB2312 (strict subset of GBK); falls back to GBK with
+replacement for any undecodable byte.
+"""
+from __future__ import annotations
+import argparse
+import http.cookiejar
+import json
+import os
+import re
+import ssl
+import time
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+API_BASE = "https://api.asmr-200.com"
+APP_BASE = "https://asmr.one"
+LIBRARY_ROOT = Path(os.environ.get("ASMR_LIBRARY_ROOT", Path.home() / "ASMR"))
+COOKIE_JAR = Path.home() / ".hermes" / "asmr" / ".asmr-one-cookies.txt"
+
+AUDIO_EXTS = {".mp3", ".wav", ".flac", ".m4a", ".aac", ".ogg", ".opus"}
+SUB_EXTS = (".vtt", ".srt", ".ass", ".lrc")
+SUB_RE = re.compile(r"\.(vtt|srt|ass|lrc)$", re.I)
+AUDIO_NAME_RE = re.compile(r"\.(mp3|wav|flac|m4a|aac|ogg|opus)$", re.I)
+RJ_RE = re.compile(r"^RJ\d+$", re.I)
+
+# Language priority: lower index = better
+LANG_PRIORITY = {
+    "CHI_HANS": 0,  # 简体中文
+    "CHN": 0,
+    "CHS": 0,
+    "zh-cn": 0,
+    "简体": 0,
+    "简体中文": 0,
+    "CHI_HANT": 1,  # 繁体中文
+    "CHT": 1,
+    "zh-tw": 1,
+    "zh-hk": 1,
+    "繁體": 1,
+    "繁体": 1,
+    "繁体中文": 1,
+    "ENG": 2,
+    "JPN": 9,
+    "JAP": 9,
+    "ja-jp": 9,
+    "日本語": 9,
+}
+
+UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/605.1.15 "
+      "(KHTML, like Gecko) Version/17.0 Safari/605.1.15")
+
+
+# --------------------------------------------------------------------------- #
+# HTTP
+# --------------------------------------------------------------------------- #
+
+def build_opener() -> urllib.request.OpenerDirector:
+    """Cookie-jar-backed opener. Cookies persist to COOKIE_JAR between calls."""
+    cj = http.cookiejar.MozillaCookieJar(str(COOKIE_JAR))
+    if COOKIE_JAR.exists():
+        try:
+            cj.load(ignore_discard=True, ignore_expires=True)
+        except Exception:
+            pass
+    opener = urllib.request.build_opener(
+        urllib.request.HTTPCookieProcessor(cj),
+        urllib.request.HTTPSHandler(context=ssl.create_default_context()),
+    )
+    opener.addheaders = [
+        ("User-Agent", UA),
+        ("Accept", "application/json, text/plain, */*"),
+        ("Origin", APP_BASE),
+        ("Referer", APP_BASE + "/"),
+    ]
+    opener.save_cookie_jar = cj
+    return opener
+
+
+def save_cookies(opener: urllib.request.OpenerDirector) -> None:
+    COOKIE_JAR.parent.mkdir(parents=True, exist_ok=True)
+    opener.save_cookie_jar.save(ignore_discard=True, ignore_expires=True)
+
+
+def api_get(opener, path: str):
+    req = urllib.request.Request(API_BASE + path, headers={"Accept": "application/json"})
+    last_error: Exception | None = None
+    for attempt in range(1, 5):
+        try:
+            with opener.open(req, timeout=15) as r:
+                return json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            return {"_status": e.code, "_body": e.read().decode("utf-8", "ignore")[:300]}
+        except (urllib.error.URLError, TimeoutError, ConnectionError, ssl.SSLError, OSError) as e:
+            last_error = e
+            if attempt >= 4:
+                raise
+            time.sleep(min(2 ** attempt, 8))
+    raise last_error  # type: ignore[misc]
+
+
+def api_post(opener, path: str, body: dict) -> dict:
+    data = json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(API_BASE + path, data=data, method="POST",
+                                 headers={"Content-Type": "application/json",
+                                          "Accept": "application/json"})
+    last_error: Exception | None = None
+    for attempt in range(1, 5):
+        try:
+            with opener.open(req, timeout=15) as r:
+                return json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            return {"_status": e.code, "_body": e.read().decode("utf-8", "ignore")[:300]}
+        except (urllib.error.URLError, TimeoutError, ConnectionError, ssl.SSLError, OSError) as e:
+            last_error = e
+            if attempt >= 4:
+                raise
+            time.sleep(min(2 ** attempt, 8))
+    raise last_error  # type: ignore[misc]
+
+
+# --------------------------------------------------------------------------- #
+# Auth
+# --------------------------------------------------------------------------- #
+
+def login(name: str, password: str) -> bool:
+    opener = build_opener()
+    r = api_post(opener, "/api/auth/me", {"name": name, "password": password})
+    if r.get("user", {}).get("loggedIn"):
+        save_cookies(opener)
+        print(f"login OK as {r['user']['name']} (group={r['user'].get('group')})")
+        return True
+    print(f"login failed: {r}")
+    return False
+
+
+def rj_to_asmr_id(rj: str) -> str:
+    if not RJ_RE.match(rj):
+        raise ValueError(f"bad RJ code: {rj}")
+    return rj[2:]
+
+
+# --------------------------------------------------------------------------- #
+# asmr.one lookups
+# --------------------------------------------------------------------------- #
+
+def get_work_info(opener, rj: str) -> dict:
+    return api_get(opener, f"/api/workInfo/{rj_to_asmr_id(rj)}")
+
+
+def get_tracks(opener, rj: str):
+    return api_get(opener, f"/api/tracks/{rj_to_asmr_id(rj)}")
+
+
+def discover_siblings(opener, rj: str) -> list[dict]:
+    """Return candidate sibling editions for `rj`, in priority order.
+
+    Each entry is a dict with at least:
+      rj, lang, has_subtitle, lang_label, source ('language_editions' /
+      'other_language_editions_in_db' / 'self').
+
+    The first entry is always the input RJ itself (so the caller can
+    decide whether to keep it as a last-resort fallback).
+    """
+    info = get_work_info(opener, rj)
+    if "_status" in info:
+        return []
+    out = []
+
+    def lang_rank(lang: str) -> int:
+        if not lang:
+            return 99
+        return LANG_PRIORITY.get(lang, LANG_PRIORITY.get(lang.upper(), 50))
+
+    seen = set()
+    self_entry = {
+        "rj": rj.upper(),
+        "lang": (info.get("translation_info") or {}).get("lang", "JPN"),
+        "lang_label": "日本語" if ((info.get("translation_info") or {}).get("is_original"))
+                       else (info.get("translation_info") or {}).get("lang", ""),
+        "has_subtitle": bool(info.get("has_subtitle")),
+        "source": "self",
+    }
+    out.append(self_entry)
+    seen.add(self_entry["rj"])
+
+    # 1) language_editions: list of {lang, workno, label, display_order, ...}
+    for entry in (info.get("language_editions") or []):
+        workno = (entry.get("workno") or "").upper()
+        if not RJ_RE.match(workno) or workno in seen:
+            continue
+        # workno is like "RJ01526627"; the /api/workInfo key is the asmr-id.
+        asmr_id = rj_to_asmr_id(workno)
+        sub_info = get_work_info(opener, workno)
+        if "_status" in sub_info:
+            continue
+        out.append({
+            "rj": workno,
+            "lang": entry.get("lang", ""),
+            "lang_label": entry.get("label", ""),
+            "has_subtitle": bool(sub_info.get("has_subtitle")),
+            "source": "language_editions",
+        })
+        seen.add(workno)
+
+    # 2) other_language_editions_in_db: list of {id, lang, title, source_id, ...}
+    for entry in (info.get("other_language_editions_in_db") or []):
+        sid = (entry.get("source_id") or "").upper()
+        if not RJ_RE.match(sid) or sid in seen:
+            continue
+        sub_info = get_work_info(opener, sid)
+        if "_status" in sub_info:
+            continue
+        out.append({
+            "rj": sid,
+            "lang": entry.get("lang", ""),
+            "lang_label": entry.get("lang", ""),
+            "has_subtitle": bool(sub_info.get("has_subtitle")),
+            "source": "other_language_editions_in_db",
+        })
+        seen.add(sid)
+
+    # Sort: sub-having first, then by lang priority
+    def sort_key(e):
+        return (
+            0 if e["has_subtitle"] else 1,
+            LANG_PRIORITY.get(e["lang"], 50) if e["lang"] else 50,
+            0 if e["source"] == "language_editions" else
+              1 if e["source"] == "other_language_editions_in_db" else 2,
+        )
+    out.sort(key=sort_key)
+    return out
+
+
+def pick_sub_source(siblings: list[dict], self_rj: str) -> dict | None:
+    """Return the best sibling to fetch subs from, or None if none have subs.
+
+    The best sub-having sibling wins. If the input RJ itself has subs
+    (the user pointed at a translation), use it. Otherwise prefer the
+    lowest-rank lang with has_subtitle=True.
+    """
+    self_rj = self_rj.upper()
+    for s in siblings:
+        if s["rj"] == self_rj and s["has_subtitle"]:
+            return s
+    for s in siblings:
+        if s["has_subtitle"]:
+            return s
+    return None
+
+
+# --------------------------------------------------------------------------- #
+# Track tree helpers
+# --------------------------------------------------------------------------- #
+
+def walk_leaves(node: dict, path: str, out: list) -> None:
+    """Recursively collect every leaf (no children) into out with its full path.
+
+    The path is the slash-joined chain of parent titles plus the leaf's own
+    title, with a leading slash. Example for a leaf at
+    `main/01_正篇mp3/Tr_01_xxx.mp3.vtt`: path = `/main/01_正篇mp3/Tr_01_xxx.mp3.vtt`.
+    """
+    here = path + "/" + (node.get("title") or "")
+    if not node.get("children"):
+        out.append({"path": here, "node": node})
+        return
+    for c in node["children"]:
+        walk_leaves(c, here, out)
+
+
+def is_subtitle_leaf(leaf: dict) -> bool:
+    return bool(SUB_RE.search(leaf["node"].get("title", "")))
+
+
+def collect_sub_groups(tracks_root: list) -> list[dict]:
+    """Walk asmr-one's track tree and group subtitle leaves by their
+    immediate parent directory.
+
+    The asmr-one track tree for a translated work typically has:
+        <long top-level title>           (the main version folder)
+            01_正篇mp3/                   (immediate subfolders of the main version)
+                Tr_01_xxx.mp3.vtt
+                Tr_02_xxx.mp3.vtt
+            02_正篇wav/
+                Tr_01_xxx.wav.vtt
+            03_正篇無SE/
+                01_正篇mp3_無SE差分/
+                    Tr_01_xxx_無SE.mp3.vtt
+        大家一起來翻譯_台本              (the script folder — we skip this)
+
+    Returns a list of {group_path, leaves: [leaf,...]} where:
+        - group_path is the immediate parent directory of the sub leaf
+          (e.g. "01_正篇mp3" or "03_正篇無SE/01_正篇mp3_無SE差分")
+        - leaves are sorted by title so position N is stable
+    Only the first top-level version folder (i.e. the main content
+    version, not `script`) is considered.
+
+    For works where the asmr-one track tree is flat (subs directly under
+    the top-level), the group_path is "" (empty).
+    """
+    # Filter out the script folder (always has type=='folder' and is
+    # typically named script or 翻訳_台本 etc.; safest: only consider
+    # top-level folders that contain sub leaves).
+    main_versions = []
+    for top in tracks_root:
+        leaves = []
+        walk_leaves(top, "", leaves)
+        subs = [l for l in leaves if is_subtitle_leaf(l)]
+        if subs:
+            main_versions.append((top.get("title", ""), subs))
+
+    if not main_versions:
+        return []
+
+    # If there's more than one main version, prefer the one with the most
+    # subs (typical case: just one main version).
+    main_versions.sort(key=lambda x: -len(x[1]))
+    chosen_title, all_leaves = main_versions[0]
+
+    # Group by group_path (the leaf's path minus the leading slash,
+    # minus the trailing leaf filename). Leaves are produced by walk_leaves
+    # which sets path = "parent1/parent2/.../parentN" (without leading /).
+    groups: dict[str, list] = {}
+    for leaf in all_leaves:
+        full = leaf["path"]
+        # full looks like "/01_正篇mp3/Tr_01_xxx.mp3.vtt" or
+        # "/03_正篇無SE/01_正篇mp3_無SE差分/Tr_01_xxx_無SE.mp3.vtt"
+        parts = full.strip("/").split("/")
+        if len(parts) >= 2:
+            group_path = "/".join(parts[:-1])
+        else:
+            group_path = ""
+        groups.setdefault(group_path, []).append(leaf)
+
+    # Sort groups by path (stable deterministic order — typically main
+    # folder name comes first), and sort each group's leaves by title.
+    result = []
+    for group_path in sorted(groups.keys()):
+        leaves = sorted(groups[group_path],
+                         key=lambda l: l["node"].get("title", ""))
+        result.append({"group_path": group_path, "leaves": leaves})
+    return result
+
+
+# --------------------------------------------------------------------------- #
+# On-disk audio discovery
+# --------------------------------------------------------------------------- #
+
+def discover_local_audio(rj_dir: Path) -> list[dict]:
+    """Walk the user's local rj_dir and group audio files by immediate
+    parent directory.
+
+    Returns a list of {group_path, files: [Path,...]} sorted by group_path.
+    Each group's files are sorted by filename.
+
+    group_path is relative to rj_dir, with a trailing separator removed
+    but no leading one (e.g. "01_本編mp3" or "03_本編SE無し/01_本編mp3_SE無し差分").
+    For files directly in rj_dir, group_path is "".
+    """
+    if not rj_dir.is_dir():
+        return []
+
+    groups: dict[str, list] = {}
+    for p in rj_dir.rglob("*"):
+        if not p.is_file() or p.suffix.lower() not in AUDIO_EXTS:
+            continue
+        try:
+            rel = p.relative_to(rj_dir)
+            group = str(rel.parent) if rel.parent != Path(".") else ""
+        except ValueError:
+            continue
+        groups.setdefault(group, []).append(p)
+
+    result = []
+    for group_path in sorted(groups.keys()):
+        files = sorted(groups[group_path], key=lambda f: f.name)
+        result.append({"group_path": group_path, "files": files})
+    return result
+
+
+# --------------------------------------------------------------------------- #
+# Group pairing (heuristic)
+# --------------------------------------------------------------------------- #
+
+def pair_groups(sub_groups: list[dict],
+                audio_groups: list[dict]) -> list[tuple[dict, dict]]:
+    """Pair sub-having groups with audio-having groups, with audio-extension
+    awareness.
+
+    asmr-one often serves subs in both mp3 and wav format (parallel
+    `01_正篇mp3/` and `02_正篇wav/` top-level sub-folders with the same
+    track content). The user's on-disk audio is typically one format
+    only (mp3 or wav). Pairing subs with the wrong audio group is
+    catastrophic — a wav sub paired to an mp3 audio group would write
+    the .wav.vtt to a .mp3 sibling with the wrong rename.
+
+    Strategy:
+      1. Split sub_groups by their inferred audio extension (the audio
+         ext embedded in their leaf titles — `.mp3.vtt` → mp3).
+      2. Split audio_groups by their actual audio ext (the file ext
+         of their files).
+      3. For each sub ext class, pair to audio ext classes in priority
+         order: same ext first, then fallback to "any audio ext".
+      4. Within a (sub ext, audio ext) pair, run the size-priority
+         greedy match.
+
+    Returns a list of (sub_group, audio_group) pairs in the order the
+    sub groups were processed.
+    """
+    if not sub_groups or not audio_groups:
+        return []
+
+    def sub_ext(sg):
+        """Infer the audio ext that a sub group is for, from its leaves."""
+        for leaf in sg["leaves"]:
+            title = leaf["node"].get("title", "")
+            m = AUDIO_NAME_RE.search(SUB_RE.sub("", title))
+            if m:
+                return m.group(0).lower()
+        return ""
+
+    def audio_ext(ag):
+        """Infer the audio ext that an audio group is for, from its files."""
+        # All files in a group should share the same ext, but be defensive.
+        exts = {f.suffix.lower() for f in ag["files"]}
+        if len(exts) == 1:
+            return exts.pop()
+        # Mixed ext: treat as "" (matches anything).
+        return ""
+
+    by_sub_ext: dict[str, list[dict]] = {}
+    for sg in sub_groups:
+        by_sub_ext.setdefault(sub_ext(sg), []).append(sg)
+    by_audio_ext: dict[str, list[dict]] = {}
+    for ag in audio_groups:
+        by_audio_ext.setdefault(audio_ext(ag), []).append(ag)
+
+    # Order sub ext classes: most common first; "" (untyped) last.
+    sub_ext_order = [e for e, _ in
+                      sorted(by_sub_ext.items(), key=lambda kv: -len(kv[1]))]
+
+    pairs: list[tuple[dict, dict]] = []
+    used_audio_idx: set[int] = set()
+    # Build a flat list of (idx, ag) over all audio groups for fallback.
+    all_audio = list(enumerate(audio_groups))
+
+    def find_match(sg):
+        target_ext = sub_ext(sg)
+        # Pass 1: same ext
+        candidates = [(i, ag) for i, ag in all_audio
+                      if i not in used_audio_idx and audio_ext(ag) == target_ext]
+        if not candidates:
+            # Pass 2: untyped audio (mixed ext)
+            candidates = [(i, ag) for i, ag in all_audio
+                          if i not in used_audio_idx and audio_ext(ag) == ""]
+        if not candidates:
+            # Pass 3: any audio (cross-format fallback)
+            candidates = [(i, ag) for i, ag in all_audio
+                          if i not in used_audio_idx]
+        if not candidates:
+            return None
+        # Within candidates, prefer exact size match, then largest group.
+        exact = [(i, ag) for i, ag in candidates
+                 if len(ag["files"]) == len(sg["leaves"])]
+        pool = exact if exact else candidates
+        pool.sort(key=lambda p: (-len(p[1]["files"]), p[1]["group_path"]))
+        return pool[0]
+
+    for sext in sub_ext_order:
+        # Process sub groups of this ext class in size-DESC order
+        sgs = sorted(by_sub_ext[sext],
+                      key=lambda g: (-len(g["leaves"]), g["group_path"]))
+        for sg in sgs:
+            m = find_match(sg)
+            if m is None:
+                continue
+            i, ag = m
+            pairs.append((sg, ag))
+            used_audio_idx.add(i)
+    return pairs
+
+
+# --------------------------------------------------------------------------- #
+# Per-subtitle matching
+# --------------------------------------------------------------------------- #
+
+def match_sub_to_audio(sub_leaf: dict,
+                        paired_audio_files: list[Path]) -> tuple[Path, str] | None:
+    """Match one asmr-one subtitle leaf to a local audio file.
+
+    Returns (audio_path, rewritten_sub_filename) or None if no match.
+
+    Matching strategy (first hit wins):
+      1. Filename-equal fast path: if the sub's expected audio name
+         (title minus sub ext) matches a local audio filename, pair it
+         and write the sub with the asmr-one title.
+      2. Position-based: pair sub at index N with audio at index N.
+         The output sub filename is the local audio's filename plus the
+         sub extension.
+    """
+    title = sub_leaf["node"].get("title", "")
+    m = SUB_RE.search(title)
+    if not m:
+        return None
+    sub_ext = m.group(0).lower()
+    expected_audio = title[:m.start()]  # e.g. "Tr_01_xxx.mp3"
+
+    # 1) Filename equal
+    for audio in paired_audio_files:
+        if audio.name == expected_audio:
+            return audio, title
+
+    # 2) Position-based
+    if sub_leaf.get("_pos") is not None:
+        pos = sub_leaf["_pos"]
+        if 0 <= pos < len(paired_audio_files):
+            audio = paired_audio_files[pos]
+            rewritten = audio.name + sub_ext
+            return audio, rewritten
+
+    return None
+
+
+# --------------------------------------------------------------------------- #
+# Download
+# --------------------------------------------------------------------------- #
+
+def download_subtitle(opener, url: str, attempts: int = 4) -> bytes:
+    last_error: Exception | None = None
+    req = urllib.request.Request(url, headers={"Accept": "*/*"})
+    for attempt in range(1, attempts + 1):
+        try:
+            with opener.open(req, timeout=30) as r:
+                return r.read()
+        except (
+            urllib.error.URLError,
+            TimeoutError,
+            ConnectionError,
+            ssl.SSLError,
+            OSError,
+        ) as e:
+            last_error = e
+            if attempt >= attempts:
+                break
+            time.sleep(min(2 ** attempt, 8))
+    assert last_error is not None
+    raise last_error
+
+
+def decode_subtitle(raw: bytes) -> tuple[str, str]:
+    # asmr.one subtitle payloads are not consistently labelled.  Most
+    # Simplified Chinese files are GB2312/GBK, while many Traditional
+    # Chinese files are UTF-8.  Trying GBK first corrupts valid UTF-8
+    # into mojibake like "铻�銆..."; prefer UTF-8, then fall back to
+    # mainland Chinese legacy encodings.
+    for enc in ("utf-8-sig", "utf-8", "gb18030", "gbk", "gb2312"):
+        try:
+            return raw.decode(enc), enc
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("utf-8", errors="replace"), "utf-8-replace"
+
+
+# --------------------------------------------------------------------------- #
+# Subcommands
+# --------------------------------------------------------------------------- #
+
+def cmd_login(args):
+    if not login(args.name, args.password):
+        sys.exit(1)
+
+
+def cmd_check(args):
+    opener = build_opener()
+    for rj in args.rjs:
+        info = get_work_info(opener, rj)
+        if "_status" in info:
+            print(f"  {rj}  HTTP {info['_status']}: {info.get('_body','')[:80]}")
+            continue
+        has_sub = info.get("has_subtitle")
+        sibs = discover_siblings(opener, rj)
+        sib_lines = []
+        for s in sibs:
+            if s["rj"] == rj.upper():
+                continue
+            marker = "*" if s["has_subtitle"] else " "
+            sib_lines.append(f"{marker}{s['rj']}({s['lang_label'] or s['lang']})")
+        sib_str = "  sibs=" + " ".join(sib_lines) if sib_lines else ""
+        print(f"  {rj}  has_subtitle={has_sub}  title={info.get('title','')[:40]}{sib_str}")
+
+
+def cmd_fetch(args):
+    opener = build_opener()
+    save_cookies(opener)
+    total = 0
+    failed = 0
+    for rj in args.rjs:
+        try:
+            n = fetch_one(opener, rj, dry_run=args.dry_run,
+                           source_rj=args.from_rj)
+            total += n
+            if n == 0:
+                failed += 1
+        except Exception as e:
+            print(f"  {rj}: error: {e}", file=sys.stderr)
+            failed += 1
+    if total == 0 and failed > 0:
+        sys.exit(2)
+
+
+def fetch_one(opener, rj: str, dry_run: bool = False,
+              source_rj: str | None = None) -> int:
+    rj_dir = LIBRARY_ROOT / rj
+    if not rj_dir.is_dir():
+        print(f"  {rj}: library folder missing at {rj_dir}")
+        return 0
+
+    if source_rj:
+        # User explicitly overrode the source RJ; skip discovery and use it.
+        siblings = [{
+            "rj": source_rj.upper(),
+            "lang": "MANUAL",
+            "lang_label": "manual override",
+            "has_subtitle": True,
+            "source": "manual",
+        }]
+    else:
+        siblings = discover_siblings(opener, rj)
+    if not siblings:
+        print(f"  {rj}: could not load workInfo from asmr.one")
+        return 0
+    chosen = pick_sub_source(siblings, rj)
+    if chosen is None:
+        print(f"  {rj}: no sub-having sibling found in asmr.one (checked "
+              f"{len(siblings)} edition(s))")
+        return 0
+
+    print(f"  {rj}: using sub source {chosen['rj']} "
+          f"({chosen['lang_label'] or chosen['lang']})")
+
+    tracks = get_tracks(opener, chosen["rj"])
+    if not isinstance(tracks, list) or not tracks:
+        print(f"  {rj}: tracks API returned empty/non-list for {chosen['rj']}")
+        return 0
+
+    sub_groups = collect_sub_groups(tracks)
+    if not sub_groups:
+        print(f"  {rj}: asmr.one says has_subtitle=True but no subtitle leaves in track tree")
+        return 0
+
+    audio_groups = discover_local_audio(rj_dir)
+    if not audio_groups:
+        print(f"  {rj}: no audio files found in {rj_dir}")
+        return 0
+
+    pairs = pair_groups(sub_groups, audio_groups)
+    if not pairs:
+        print(f"  {rj}: no audio/sub group pairings produced")
+        return 0
+
+    # When asmr-one has both mp3 and wav sub formats of the same content
+    # (very common for translated works — every sub group has a parallel
+    # wav version), the same local audio file would be hit by multiple
+    # subs at the same position. Track which audio files have already
+    # been matched in this run, and skip subsequent subs that would
+    # overwrite them. (The first pair wins, so order matters — the
+    # `pair_groups` heuristic is biased toward the largest sub group,
+    # which is usually the main mp3 group.)
+    written = 0
+    matched_audios: set[Path] = set()
+    for sg, ag in pairs:
+        for pos, sub_leaf in enumerate(sg["leaves"]):
+            sub_leaf["_pos"] = pos
+            title = sub_leaf["node"].get("title", "")
+            url = (sub_leaf["node"].get("mediaDownloadUrl")
+                    or sub_leaf["node"].get("mediaStreamUrl"))
+            if not url:
+                print(f"    {sg['group_path']}/{title}: no download URL — skipping")
+                continue
+            match = match_sub_to_audio(sub_leaf, ag["files"])
+            if match is None:
+                print(f"    {sg['group_path']}/{title}: no audio match "
+                      f"(audio group={ag['group_path']!r} n={len(ag['files'])}) — skipping")
+                continue
+            audio, rewritten = match
+            if audio in matched_audios:
+                # Already paired by an earlier sub group (e.g. the mp3
+                # version already wrote Tr_XX.mp3.vtt; skip the parallel
+                # wav version's sub).
+                continue
+            target = audio.parent / rewritten
+            if dry_run:
+                exists = "[exists]" if target.exists() else "[new]"
+                tag = ("(filename-equal)" if rewritten == title
+                       else f"(pos={pos}/{len(ag['files'])-1} → {audio.name})")
+                print(f"    [dry-run] {exists} {sg['group_path']}/{title} "
+                      f"→ {target}  {tag}")
+                matched_audios.add(audio)
+                written += 1
+                continue
+            try:
+                raw = download_subtitle(opener, url)
+            except Exception as e:
+                print(f" {sg['group_path']}/{title}: download failed after retries: {e} — skipping",
+                      file=sys.stderr)
+                continue
+            text, encoding = decode_subtitle(raw)
+            target.write_text(text, encoding="utf-8")
+            matched_audios.add(audio)
+            written += 1
+            print(f"    {rewritten}: {len(raw)}B {encoding} -> {target}")
+
+    # Surface group-pairing warnings
+    if len(sub_groups) > len(audio_groups):
+        print(f"  {rj}: note: {len(sub_groups)} sub groups but only "
+              f"{len(audio_groups)} local audio groups; "
+              f"extra sub groups were skipped")
+    elif len(audio_groups) > len(sub_groups):
+        print(f"  {rj}: note: {len(audio_groups)} local audio groups but only "
+              f"{len(sub_groups)} sub groups; "
+              f"extra audio groups were left without subs")
+
+    return written
+
+
+def cmd_list_missing(args):
+    """Scan library for RJs with no on-disk subtitle files."""
+    sub_exts = {e.lower() for e in SUB_EXTS}
+    missing = []
+    for rj_dir in sorted(LIBRARY_ROOT.iterdir()):
+        if not rj_dir.is_dir() or not RJ_RE.match(rj_dir.name):
+            continue
+        has_audio = any(p.suffix.lower() in AUDIO_EXTS
+                        for p in rj_dir.rglob("*") if p.is_file())
+        if not has_audio:
+            continue
+        has_sub = any(p.suffix.lower() in sub_exts
+                      for p in rj_dir.rglob("*") if p.is_file())
+        if not has_sub:
+            missing.append(rj_dir.name)
+    for rj in missing:
+        print(rj)
+    print(f"\n{len(missing)} RJ folder(s) with no on-disk subtitles.", file=sys.stderr)
+
+
+def cmd_fetch_missing(args):
+    """fetch for all RJs in library that have no on-disk subs (or a user-supplied subset)."""
+    opener = build_opener()
+    save_cookies(opener)
+    if args.rjs:
+        rjs = args.rjs
+    else:
+        sub_exts = {e.lower() for e in SUB_EXTS}
+        rjs = []
+        for rj_dir in sorted(LIBRARY_ROOT.iterdir()):
+            if not rj_dir.is_dir() or not RJ_RE.match(rj_dir.name):
+                continue
+            if not any(p.suffix.lower() in AUDIO_EXTS
+                       for p in rj_dir.rglob("*") if p.is_file()):
+                continue
+            if any(p.suffix.lower() in sub_exts
+                   for p in rj_dir.rglob("*") if p.is_file()):
+                continue
+            rjs.append(rj_dir.name)
+        print(f"Found {len(rjs)} RJs without on-disk subs")
+    total = 0
+    for rj in rjs:
+        total += fetch_one(opener, rj, dry_run=args.dry_run, source_rj=args.from_rj)
+    print(f"\nTotal: wrote {total} subtitle file(s) across {len(rjs)} RJ(s).")
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Fetch Chinese subs from asmr.one into the asmr-library")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    p = sub.add_parser("login", help="one-time login, persists session cookie")
+    p.add_argument("name")
+    p.add_argument("password")
+    p.set_defaults(func=cmd_login)
+    p = sub.add_parser("check", help="check has_subtitle + sibling editions for given RJs")
+    p.add_argument("rjs", nargs="+")
+    p.set_defaults(func=cmd_check)
+    p = sub.add_parser("fetch", help="download subs for given RJs to ASMR_LIBRARY_ROOT (default ~/ASMR)")
+    p.add_argument("rjs", nargs="+")
+    p.add_argument("--dry-run", action="store_true",
+                   help="show what would be written without downloading")
+    p.add_argument("--from-rj", metavar="RJ",
+                   help="override sub source RJ (skip auto-discovery; use the "
+                        "given sub-having RJ as the source)")
+    p.set_defaults(func=cmd_fetch)
+    p = sub.add_parser("list-missing", help="list RJs without on-disk subs")
+    p.set_defaults(func=cmd_list_missing)
+    p = sub.add_parser("fetch-missing",
+                       help="fetch subs for all RJs missing on-disk subs")
+    p.add_argument("rjs", nargs="*", help="optional subset of RJs to consider")
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--from-rj", metavar="RJ",
+                   help="override sub source RJ for every work")
+    p.set_defaults(func=cmd_fetch_missing)
+    args = ap.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()

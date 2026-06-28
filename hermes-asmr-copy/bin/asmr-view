@@ -1,0 +1,2156 @@
+#!/usr/bin/env python3
+"""asmr-view — Neokikoeru-style local viewer.
+
+Lightweight HTTP server (stdlib only) that serves a Vue 3 + Quasar SPA
+backed by the same SQLite database Neokikoeru uses. Bypasses Neokikoeru's
+license gate by reading files/folders directly from the DB and streaming
+audio via Neokikoeru's unencrypted /fs/download endpoint.
+
+Endpoints:
+  GET /                                -> SPA index.html
+  GET /api/health                      -> {ok, works, covers}
+  GET /api/works?page=N&size=M&search= -> JSON work list
+  GET /api/work/<rj>                   -> JSON work metadata + genres
+  GET /api/files?rj=<rj>&path=<p>      -> JSON file list (folders + leaves)
+  GET /api/cover/<rj>                  -> cover image (jpg/jpeg/png/gif)
+  GET /api/stream/<file_id>            -> stream audio via /fs/download
+  GET /api/duration/<file_id>          -> probe audio duration (HEAD)
+
+Usage:
+  asmr-view start [--port 8890] [--host 127.0.0.1]
+  asmr-view stop
+  asmr-view status
+  asmr-view open
+  asmr-view logs [-f]
+"""
+from __future__ import annotations
+
+import argparse
+import base64
+import hmac
+import json
+import importlib.util
+import importlib.machinery
+import mimetypes
+import os
+import re
+import signal
+import shutil
+import sqlite3
+import subprocess
+import sys
+import threading
+import time
+import urllib.parse
+import urllib.request
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+# Bring in the kikoeru-compatible endpoints (lazy-imported in handler
+# to keep the top-level import fast).
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+import asmr_view_kikoeru as _kikoeru  # noqa: E402
+
+# ---------------------------------------------------------------------------
+# Paths & config
+# ---------------------------------------------------------------------------
+
+HERMES_ASMR = Path.home() / ".hermes" / "asmr"
+CONFIG_PATH = HERMES_ASMR / "serve-config.json"
+ADMIN_DEFAULT_USER = "admin"
+ADMIN_DEFAULT_PASSWORD = "mygo"
+PROTECTED_DASHBOARD_ACTIONS = {"download", "retry", "fill"}
+VIEW_DIR = HERMES_ASMR / "view"
+KIKOERU_SPA_DIR = HERMES_ASMR / "kikoeru-spa"
+LOG_PATH = HERMES_ASMR / "asmr-view.log"
+PID_PATH = HERMES_ASMR / "asmr-view.pid"
+
+NEOKIKOERU_DATA = Path.home() / "Library" / "Application Support" / "neokikoeru"
+NEOKIKOERU_DB = NEOKIKOERU_DATA / "neokikoeru.db"
+NEOKIKOERU_COVERS_ROOT = NEOKIKOERU_DATA / "covers"
+NEOKIKOERU_COVERS = NEOKIKOERU_COVERS_ROOT / "doujin"
+NEOKIKOERU_NO_IMG = NEOKIKOERU_COVERS_ROOT / "no_img_sam.gif"
+
+_DASHBOARD_MODULE = None
+
+
+def get_dashboard_module():
+    """Load the standalone asmr-dashboard script as an in-process module."""
+    global _DASHBOARD_MODULE
+    if _DASHBOARD_MODULE is not None:
+        return _DASHBOARD_MODULE
+    path = HERMES_ASMR / "bin" / "asmr-dashboard"
+    loader = importlib.machinery.SourceFileLoader("asmr_dashboard_embedded", str(path))
+    spec = importlib.util.spec_from_loader("asmr_dashboard_embedded", loader)
+    if spec is None:
+        raise RuntimeError(f"cannot load dashboard module: {path}")
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    _DASHBOARD_MODULE = mod
+    return mod
+
+# Storage root where the actual mp3/wav/jpg files live.
+# Default: ~/ASMR/  (real files; DB stores paths like /RJ01010222/...mp3)
+# Override via env var ASMR_STORAGE_ROOT or serve-config.json "storage_root".
+_DEFAULT_STORAGE_ROOT = Path.home() / "ASMR"
+
+
+def get_storage_root() -> Path:
+    """Resolve the on-disk storage root.
+
+    Lookup order:
+      1. ASMR_STORAGE_ROOT env var
+      2. serve-config.json "storage_root" key
+      3. ~/ASMR (the default)
+    """
+    env = os.environ.get("ASMR_STORAGE_ROOT")
+    if env:
+        return Path(env)
+    if CONFIG_PATH.exists():
+        try:
+            cfg_root = json.loads(CONFIG_PATH.read_text()).get("storage_root")
+            if cfg_root:
+                return Path(cfg_root)
+        except Exception:
+            pass
+    return _DEFAULT_STORAGE_ROOT
+
+# ---------------------------------------------------------------------------
+# State (per-thread)
+# ---------------------------------------------------------------------------
+
+_state = threading.local()
+
+
+def get_db() -> sqlite3.Connection:
+    conn = getattr(_state, "db", None)
+    if conn is None:
+        conn = sqlite3.connect(f"file:{NEOKIKOERU_DB}?mode=ro", uri=True, timeout=5)
+        conn.row_factory = sqlite3.Row
+        _state.db = conn
+    return conn
+
+
+def get_write_db() -> sqlite3.Connection:
+    conn = sqlite3.connect(str(NEOKIKOERU_DB), timeout=30)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def close_read_db() -> None:
+    conn = getattr(_state, "db", None)
+    if conn is not None:
+        conn.close()
+        _state.db = None
+
+
+def get_token() -> str | None:
+    if not CONFIG_PATH.exists():
+        return None
+    try:
+        return json.loads(CONFIG_PATH.read_text()).get("token")
+    except Exception:
+        return None
+
+
+def get_neo_port() -> int:
+    if CONFIG_PATH.is_file():
+        try:
+            return int(json.loads(CONFIG_PATH.read_text()).get("port", 8889))
+        except Exception:
+            pass
+    return 8889
+
+
+def get_admin_credentials() -> tuple[str, str]:
+    cfg = {}
+    if CONFIG_PATH.is_file():
+        try:
+            cfg = json.loads(CONFIG_PATH.read_text())
+        except Exception:
+            cfg = {}
+    user = str(cfg.get("admin_user") or ADMIN_DEFAULT_USER)
+    password = str(cfg.get("admin_password") or ADMIN_DEFAULT_PASSWORD)
+    return user, password
+
+
+def is_loopback_host(host: str) -> bool:
+    return host in {"127.0.0.1", "::1", "localhost"} or host.startswith("127.")
+
+
+# ---------------------------------------------------------------------------
+# Cover image resolution
+# ---------------------------------------------------------------------------
+
+# map rj_id -> { "main": abs_path, "sam": abs_path, "thumb": abs_path }
+_COVER_CACHE: dict[str, dict[str, Path]] = {}
+
+
+def build_cover_cache() -> None:
+    """Populate the cover cache, keyed by the WORK's RJ id (not the file's).
+
+    Neokikoeru stores covers in `covers/doujin/RJ01011000/RJ01010222_img_main.jpg`
+    — the bucket is the 6-char work-id prefix, but the FILENAME may be a
+    different (stale) work-id. We trust the DB's `image_main` / `image_thumb`
+    columns instead of the filename, so the cache is keyed by the work's
+    canonical RJ code and points to whatever file the DB says belongs to it.
+    """
+    _COVER_CACHE.clear()
+    if not NEOKIKOERU_COVERS.is_dir():
+        return
+    db = get_db()
+    rows = db.execute(
+        "SELECT id, image_main, image_thumb FROM works "
+        "WHERE image_main != '' OR image_thumb != ''"
+    ).fetchall()
+    for row in rows:
+        work_rj = row["id"]
+        kinds: dict[str, Path] = {}
+        # Neokikoeru stores image_main as paths relative to
+        # `Library/Application Support/neokikoeru/` (e.g.
+        # "doujin/RJ329000/...") — but the actual files live in
+        # `covers/doujin/RJ329000/...`. Try both roots.
+        for root in (NEOKIKOERU_DATA / "covers", NEOKIKOERU_DATA):
+            if row["image_main"]:
+                p = root / row["image_main"]
+                if p.is_file():
+                    kinds["main"] = p
+                    break
+        for root in (NEOKIKOERU_DATA / "covers", NEOKIKOERU_DATA):
+            if row["image_thumb"]:
+                p = root / row["image_thumb"]
+                if p.is_file():
+                    kinds["sam" if "sam" in row["image_thumb"] else "thumb"] = p
+                    break
+        if kinds:
+            _COVER_CACHE[work_rj] = kinds
+
+
+def resolve_cover(rj: str) -> Path | None:
+    """Best available cover for rj: main > sam > thumb > None."""
+    kinds = _COVER_CACHE.get(rj)
+    if not kinds:
+        return None
+    for k in ("main", "sam", "thumb"):
+        if k in kinds:
+            return kinds[k]
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Database queries (read against the verified schema)
+# ---------------------------------------------------------------------------
+
+WORK_SELECT = """
+SELECT
+    w.id, w.name AS title, w.intro,
+    w.rating, w.rating_count, w.review_count,
+    w.wishlist_count, w.price, w.sales,
+    w.age_category, w.image_main, w.image_thumb,
+    w.created_at, w.updated_at, w.released_at,
+    m.id AS maker_id, m.name AS maker_name,
+    (SELECT COUNT(*) FROM files f WHERE f.work_id = w.id AND f.is_folder = 1) AS folder_count,
+    (SELECT COUNT(*) FROM files fi WHERE fi.work_id = w.id AND (fi.is_folder IS NULL OR fi.is_folder = 0)) AS file_count,
+    (SELECT COALESCE(SUM(size), 0) FROM files fi WHERE fi.work_id = w.id AND (fi.is_folder IS NULL OR fi.is_folder = 0)) AS total_size
+FROM works w
+LEFT JOIN makers m ON w.maker_id = m.id
+"""
+
+
+# Whitelist of sortable columns exposed by the kikoeru sort UI.
+# Maps the `order` query param to a SQL ORDER BY expression. The
+# kikoeru-quasar SPA's Works.vue sends `order=<key>&sort=<asc|desc>`
+# in the request. Anything not in this map is silently ignored and
+# the default (id DESC) is used.
+#
+# Special cases:
+#   * `id` (RJ号) — sort by the numeric part of the RJ code so
+#     8-digit codes (e.g. RJ01114021) sort larger than 6-digit
+#     codes (e.g. RJ439991) regardless of the leading "RJ" prefix.
+#     Lexicographic on the full id would put 8-digit codes first
+#     by mistake (since '0' < '4'). We CAST(SUBSTR(id,3) AS INT) to
+#     get a real numeric compare.
+#   * `random` — uses the `seed` query param so the same seed gives
+#     a stable order across paginated requests. The SPA picks a new
+#     random seed whenever the sort option changes or the user
+#     navigates back; subsequent pages of the same view reuse the
+#     same seed.
+#   * `nsfw` — kikoeru sends `sort=asc` to mean "全年龄新作优先"
+#     (all-ages new releases first). Age category 0=ALL, 1=R15,
+#     2=R18, so ASC by age_category puts ALL first; we also tie-
+#     break by released_at DESC so newer releases come first within
+#     each age tier.
+_SORT_MAP = {
+    "id":              "CAST(SUBSTR(w.id, 3) AS INTEGER)",
+    "release":         "w.released_at",
+    "rating":          "w.rating",
+    "dl_count":        "w.sales",
+    "price":           "w.price",
+    "rate_average_2dp": "w.rating",
+    "review_count":    "w.review_count",
+    "nsfw":            "w.age_category, w.released_at",
+}
+
+_SORT_DIRS = ("asc", "desc")
+
+
+def _order_sql(order: str, sort: str, seed: int) -> str:
+    direction = sort.lower() if isinstance(sort, str) and sort.lower() in _SORT_DIRS else "desc"
+    if order == "betterRandom":
+        return "RANDOM()"
+    if order == "random":
+        if not seed:
+            seed = time.time_ns() & 0xffff
+        return (
+            f"((CAST(SUBSTR(w.id, 3) AS INTEGER) * {int(seed) & 0xffff} "
+            "* 2654435761) % 2147483647), w.id DESC"
+        )
+    col = _SORT_MAP.get(order, "CAST(SUBSTR(w.id, 3) AS INTEGER)")
+    return f"{col} {direction.upper()}, w.id DESC"
+
+
+def list_works(
+    page: int = 1,
+    size: int = 24,
+    search: str = "",
+    order: str = "id",
+    sort: str = "desc",
+    seed: int = 0,
+) -> dict:
+    """Paginated work list for the kikoeru `/api/works` endpoint.
+
+    `order`/`sort` mirror the kikoeru-quasar SPA's sort dropdown
+    (see `Works.vue` `sortOption`). When `order == "random"` the
+    `seed` parameter is used as the SQLite random seed so paginated
+    requests for the same view return a stable order.
+    """
+    conn = get_db()
+    offset = (page - 1) * size
+    where = ""
+    params: list = []
+    if search:
+        where = """
+WHERE
+  w.id LIKE ?
+  OR w.name LIKE ?
+  OR w.intro LIKE ?
+  OR m.name LIKE ?
+  OR EXISTS (
+    SELECT 1 FROM series s
+    WHERE s.id = w.series_id AND s.name LIKE ?
+  )
+  OR EXISTS (
+    SELECT 1 FROM genre_works gw
+    JOIN genres g ON g.id = gw.genre_id
+    WHERE gw.work_id = w.id AND g.name LIKE ?
+  )
+  OR EXISTS (
+    SELECT 1 FROM artist_works aw
+    JOIN artists a ON a.id = aw.artist_id
+    WHERE aw.work_id = w.id AND a.name LIKE ?
+  )
+  OR EXISTS (
+    SELECT 1 FROM illustrator_works iw
+    JOIN illustrators i ON i.id = iw.illustrator_id
+    WHERE iw.work_id = w.id AND i.name LIKE ?
+  )
+"""
+        like = f"%{search}%"
+        params = [like] * 8
+    total = conn.execute(
+        f"SELECT COUNT(*) FROM works w LEFT JOIN makers m ON w.maker_id = m.id {where}", params
+    ).fetchone()[0]
+
+    # Build the ORDER BY clause.
+    direction = sort.lower() if isinstance(sort, str) and sort.lower() in _SORT_DIRS else "desc"
+    if order == "betterRandom":
+        order_sql = "RANDOM()"
+    elif order == "random":
+        # PRAGMA random_seed doesn't make RANDOM() reproducible in
+        # SQLite, so we use a deterministic transform on the row's
+        # id + the request's seed. The Knuth multiplicative hash
+        # gives good distribution; the seed is multiplied by a
+        # large prime so different seeds produce different orders
+        # even for small changes.
+        order_sql = (
+            f"((CAST(SUBSTR(w.id, 3) AS INTEGER) * {int(seed) & 0xffff} "
+            "* 2654435761) % 2147483647)"
+        )
+    else:
+        col = _SORT_MAP.get(order, "CAST(SUBSTR(w.id, 3) AS INTEGER)")
+        order_sql = f"{col} {direction.upper()}, w.id DESC"
+
+    rows = conn.execute(
+        f"{WORK_SELECT} {where} ORDER BY {order_sql} LIMIT ? OFFSET ?",
+        [*params, size, offset],
+    ).fetchall()
+    works = [_row_to_kikoeru_work(r) for r in rows]
+    # kikoeru uses {pagination: {totalCount, currentPage, pageSize}}; we also
+    # expose page/size/total at the top level for our hand-rolled SPA.
+    return {
+        "pagination": {
+            "totalCount": total,
+            "currentPage": page,
+            "pageSize": size,
+        },
+        "page": page,
+        "size": size,
+        "total": total,
+        "works": works,
+    }
+
+
+def list_works_by_relation(
+    relation: str,
+    relation_id: str,
+    page: int = 1,
+    size: int = 24,
+    order: str = "id",
+    sort: str = "desc",
+    seed: int = 0,
+) -> dict:
+    """Paginated exact group/tag/VA work list for kikoeru relation routes."""
+    conn = get_db()
+    offset = (page - 1) * size
+    relation_sql = {
+        "tag": (
+            "EXISTS (SELECT 1 FROM genre_works gw "
+            "WHERE gw.work_id = w.id AND CAST(gw.genre_id AS TEXT) = ?)"
+        ),
+        "circle": "w.maker_id = ?",
+        "va": (
+            "EXISTS (SELECT 1 FROM artist_works aw "
+            "WHERE aw.work_id = w.id AND aw.artist_id = ?)"
+        ),
+    }.get(relation)
+    if relation_sql is None:
+        return {
+            "pagination": {"totalCount": 0, "currentPage": page, "pageSize": size},
+            "page": page,
+            "size": size,
+            "total": 0,
+            "works": [],
+        }
+    params = [str(relation_id)]
+    total = conn.execute(
+        f"SELECT COUNT(*) FROM works w LEFT JOIN makers m ON w.maker_id = m.id WHERE {relation_sql}",
+        params,
+    ).fetchone()[0]
+    rows = conn.execute(
+        f"{WORK_SELECT} WHERE {relation_sql} ORDER BY {_order_sql(order, sort, seed)} LIMIT ? OFFSET ?",
+        [*params, size, offset],
+    ).fetchall()
+    works = [_row_to_kikoeru_work(r) for r in rows]
+    return {
+        "pagination": {"totalCount": total, "currentPage": page, "pageSize": size},
+        "page": page,
+        "size": size,
+        "total": total,
+        "works": works,
+    }
+
+
+def relation_detail(relation: str, relation_id: str) -> dict | None:
+    conn = get_db()
+    table = {"tag": "genres", "circle": "makers", "va": "artists"}.get(relation)
+    if table is None:
+        return None
+    row = conn.execute(f"SELECT id, name FROM {table} WHERE CAST(id AS TEXT) = ?", (str(relation_id),)).fetchone()
+    return dict(row) if row else None
+
+
+def relation_list(relation: str) -> list[dict]:
+    conn = get_db()
+    if relation == "tag":
+        rows = conn.execute(
+            """SELECT g.id, g.name, COUNT(gw.work_id) AS count
+               FROM genres g
+               JOIN genre_works gw ON gw.genre_id = g.id
+               GROUP BY g.id, g.name
+               ORDER BY count DESC, g.name"""
+        ).fetchall()
+    elif relation == "circle":
+        rows = conn.execute(
+            """SELECT m.id, m.name, COUNT(w.id) AS count
+               FROM makers m
+               JOIN works w ON w.maker_id = m.id
+               GROUP BY m.id, m.name
+               ORDER BY count DESC, m.name"""
+        ).fetchall()
+    elif relation == "va":
+        rows = conn.execute(
+            """SELECT a.id, a.name, COUNT(aw.work_id) AS count
+               FROM artists a
+               JOIN artist_works aw ON aw.artist_id = a.id
+               GROUP BY a.id, a.name
+               ORDER BY count DESC, a.name"""
+        ).fetchall()
+    else:
+        return []
+    return [dict(r) for r in rows]
+
+
+def get_work(rj: str) -> dict | None:
+    conn = get_db()
+    row = conn.execute(f"{WORK_SELECT} WHERE w.id = ?", (rj,)).fetchone()
+    if row is None:
+        return None
+    return _row_to_kikoeru_work(row, include_extras=True)
+
+
+def _row_to_kikoeru_work(row: sqlite3.Row, include_extras: bool = True) -> dict:
+    """Convert a works table row into kikoeru work-object format.
+
+    Includes our hand-rolled SPA's fields when include_extras=True so a
+    single /api/work/<id> response serves both UIs.
+    """
+    released_ms = row["released_at"] or 0
+    released = ""
+    if released_ms:
+        released = time.strftime("%Y-%m-%d", time.gmtime(released_ms / 1000))
+    rj_id = row["id"]
+    # `id` in the kikoeru work object is the full RJ string (e.g.
+    # "RJ01114021"). The kikoeru-quasar SPA's /work/:id route is
+    # /work/<id> — the same string is what the user sees in the URL
+    # bar and what the SPA sends back to /api/work/<id>. Numeric
+    # callers (e.g. paginated ranges) can do the conversion
+    # themselves; the wire format is always the RJ string.
+    rating = float(row["rating"] or 0)
+    rating_count = int(row["rating_count"] or 0)
+    review_count = int(row["review_count"] or 0)
+
+    # Kikoeru uses {circle: {id, name}} and {vas: [{id, name}, ...]}
+    maker = row["maker_name"] or ""
+    artists = get_relations(rj_id, "artist_works", "artist_id", "artists")
+    illustrators = get_relations(rj_id, "illustrator_works", "illustrator_id", "illustrators")
+    tags = get_tags(rj_id)
+
+    out = {
+        # kikoeru fields — id is the full RJ string so the SPA
+        # naturally produces /work/RJ01114021 URLs without
+        # per-component padding logic.
+        "id": rj_id,
+        "title": row["title"] or "",
+        "circle": {"id": row["maker_id"] or 0, "name": maker},
+        "vas": artists,
+        "tags": tags,
+        "rate_average_2dp": f"{rating:.2f}",
+        "rate_count": rating_count,
+        "review_count": review_count,
+        "rate_count_detail": _kikoeru._rating_distribution(rating, rating_count),
+        "dl_count": int(row["sales"] or 0),
+        "price": int(row["price"] or 0),
+        "nsfw": int(row["age_category"] or 0) >= 2,
+        "release": released,
+        "create_date": _kikoeru._ts_to_date(row["created_at"]),
+        "userRating": 0,
+        "isFavourite": False,
+        "type": "doujin",
+        "coverUrl": f"/api/covers/{rj_id}",
+    }
+    if include_extras:
+        out.update({
+            # asmr-view hand-rolled SPA extensions
+            "rj_id": rj_id,
+            "intro": row["intro"] or "",
+            "maker": maker,
+            "released": released,
+            "rating": rating,
+            "rating_count": rating_count,
+            "wishlist_count": int(row["wishlist_count"] or 0),
+            "file_count": int(row["file_count"] or 0),
+            "total_size": int(row["total_size"] or 0),
+            "age_category": int(row["age_category"] or 0),
+            "has_cover": rj_id in _COVER_CACHE,
+            "genres": [t["name"] for t in tags],
+            "artists": artists,
+            "illustrators": illustrators,
+            "image_main": row["image_main"],
+            "image_thumb": row["image_thumb"],
+        })
+    return out
+
+
+def get_tags(rj: str) -> list[dict]:
+    """Return kikoeru-format tag objects: [{id, name}, ...]."""
+    conn = get_db()
+    try:
+        rows = conn.execute(
+            """SELECT g.id, g.name FROM genres g
+               JOIN genre_works gw ON gw.genre_id = g.id
+               WHERE gw.work_id = ?
+               ORDER BY g.name""",
+            (rj,),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return []
+    return [{"id": r["id"], "name": r["name"]} for r in rows]
+
+
+def get_relations(rj: str, join_table: str, join_col: str, target_table: str) -> list[dict]:
+    conn = get_db()
+    try:
+        rows = conn.execute(
+            f"""SELECT t.id, t.name FROM {target_table} t
+                JOIN {join_table} j ON j.{join_col} = t.id
+                WHERE j.work_id = ?
+                ORDER BY t.name""",
+            (rj,),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return []
+    return [{"id": r["id"], "name": r["name"]} for r in rows]
+
+
+def list_files(rj: str, folder_path: str = "") -> dict:
+    """List files under a folder. folder_path '' = root (work dir)."""
+    conn = get_db()
+    work = conn.execute("SELECT id FROM works WHERE id = ?", (rj,)).fetchone()
+    if work is None:
+        return {"error": "work not found", "rj": rj}, 404
+
+    # Normalize: "" or "/" or "/RJ{id}" -> root; otherwise it's a subfolder path.
+    fp = folder_path.strip("/")
+    if fp and fp != rj:
+        # Subfolder: find folder row by path lookup
+        folder_row = conn.execute(
+            "SELECT id, name, parent_id, path FROM files WHERE work_id = ? AND path = ? AND is_folder = 1",
+            (rj, "/" + fp),
+        ).fetchone()
+        if folder_row is None:
+            return {"error": f"folder not found: {fp}"}, 404
+        parent_id = folder_row["id"]
+    else:
+        # Root: find the work's root folder row (parent_id IS NULL) and list its children
+        root = conn.execute(
+            "SELECT id FROM files WHERE work_id = ? AND parent_id IS NULL AND is_folder = 1 ORDER BY id LIMIT 1",
+            (rj,),
+        ).fetchone()
+        if root is None:
+            return {"rj": rj, "path": "", "breadcrumb": [], "items": []}
+        parent_id = root["id"]
+        fp = ""  # reset so breadcrumb is empty at root
+
+    rows = conn.execute(
+        """SELECT id, name, size, duration, is_folder, parent_id, path
+           FROM files
+           WHERE parent_id = ?
+           ORDER BY is_folder DESC, name""",
+        (parent_id,),
+    ).fetchall()
+
+    items = []
+    for r in rows:
+        is_folder = bool(r["is_folder"])
+        items.append({
+            "id": r["id"],
+            "name": r["name"],
+            "size": int(r["size"] or 0),
+            "duration": float(r["duration"] or 0),
+            "is_folder": is_folder,
+            "parent_id": r["parent_id"],
+            "path": r["path"],
+        })
+    # Build breadcrumb chain from path (skip the leading {rj} segment,
+    # because the SPA renders the work id as a separate static crumb).
+    breadcrumb = []
+    if fp and fp != rj:
+        parts = [p for p in fp.split("/") if p]
+        # Drop the leading "RJ{id}" segment if present
+        if parts and parts[0] == rj:
+            parts = parts[1:]
+        cur = "/" + rj
+        for p in parts:
+            cur = cur + "/" + p
+            breadcrumb.append({"name": p, "path": cur.lstrip("/")})
+    return {"rj": rj, "path": fp, "breadcrumb": breadcrumb, "items": items}
+
+
+# ---------------------------------------------------------------------------
+# HTTP handler
+# ---------------------------------------------------------------------------
+
+class AsmrViewHandler(BaseHTTPRequestHandler):
+    server_version = "asmr-view/1.0"
+
+    def log_message(self, fmt, *args):
+        sys.stderr.write(f"[{time.strftime('%H:%M:%S')}] {self.address_string()} {fmt % args}\n")
+
+    def log_error(self, fmt, *args):
+        sys.stderr.write(f"[{time.strftime('%H:%M:%S')}] ERROR {self.address_string()} {fmt % args}\n")
+        import traceback
+        traceback.print_exc(file=sys.stderr)
+
+    def do_GET(self):
+        self._dispatch()
+
+    def do_HEAD(self):
+        # Treat HEAD same as GET but don't write body
+        self._dispatch(head=True)
+
+    def do_POST(self):
+        """Handle POST requests (used by kikoeru /api/auth/me login and admin reindex)."""
+        self._dispatch_post()
+
+    def do_DELETE(self):
+        """Handle destructive admin requests."""
+        self._dispatch_delete()
+
+    def _require_dashboard_admin(self, allow_loopback: bool = True) -> bool:
+        client_host = self.client_address[0] if self.client_address else ""
+        if allow_loopback and is_loopback_host(client_host):
+            return True
+
+        user, password = get_admin_credentials()
+        auth = self.headers.get("Authorization", "")
+        if not auth.startswith("Basic "):
+            return self._dashboard_auth_failed()
+        try:
+            decoded = base64.b64decode(auth[6:].strip(), validate=True).decode("utf-8")
+        except Exception:
+            return self._dashboard_auth_failed()
+        supplied_user, sep, supplied_password = decoded.partition(":")
+        if not sep:
+            return self._dashboard_auth_failed()
+        if hmac.compare_digest(supplied_user, user) and hmac.compare_digest(supplied_password, password):
+            return True
+        return self._dashboard_auth_failed()
+
+    def _dashboard_auth_failed(self) -> bool:
+        self.send_response(HTTPStatus.UNAUTHORIZED)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("WWW-Authenticate", 'Basic realm="ASMR Library"')
+        body = b'{"error":"admin credentials required"}'
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+        return False
+
+    def _dispatch_post(self):
+        url = urllib.parse.urlparse(self.path)
+        path = url.path
+        qs = urllib.parse.parse_qs(url.query)
+        # Read body (small, kikoeru sends tiny JSON)
+        try:
+            clen = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            clen = 0
+        body = self.rfile.read(clen) if clen > 0 else b""
+        try:
+            if path.startswith("/api/asmr-library/actions/"):
+                dash = get_dashboard_module()
+                name = path.rsplit("/", 1)[-1]
+                if name in PROTECTED_DASHBOARD_ACTIONS and not self._require_dashboard_admin():
+                    return
+                try:
+                    payload = json.loads(body.decode("utf-8")) if body else {}
+                except json.JSONDecodeError:
+                    payload = {}
+                if name == "fix-covers":
+                    sample_rj = dash.rj_arg(payload.get("rj", "RJ01580504") or "RJ01580504")
+                    rec = dash.queue_action("fix-covers", [str(HERMES_ASMR / "bin" / "asmr-fix-covers-workflow"), sample_rj], timeout=1800)
+                elif name == "reindex":
+                    rec = dash.queue_action("reindex", [str(HERMES_ASMR / "bin" / "asmr-library"), "reindex"], timeout=1800)
+                else:
+                    rj = dash.rj_arg(payload.get("rj", ""))
+                    mapping = {
+                        "download": [str(HERMES_ASMR / "bin" / "asmr-library"), "download", rj],
+                        "retry": [str(HERMES_ASMR / "bin" / "asmr-library"), "retry", rj],
+                        "fill": [str(HERMES_ASMR / "bin" / "asmr-library"), "fill", rj],
+                        "fix-content": [str(HERMES_ASMR / "bin" / "asmr-fix-content-workflow"), rj],
+                        "subs-dry-run": [str(HERMES_ASMR / "bin" / "asmr-library"), "subs", "fetch", rj, "--dry-run"],
+                        "subs-fetch": [str(HERMES_ASMR / "bin" / "asmr-library"), "subs", "fetch", rj],
+                    }
+                    if name not in mapping:
+                        self._json({"error": "unknown action"}, 404)
+                        return
+                    rec = dash.queue_action(name, mapping[name], timeout=1800)
+                self._json(rec, 202)
+                return
+            if path == "/api/auth/me":
+                self._kikoeru_auth_me_post(body)
+            elif path == "/api/admin/reindex":
+                self._admin_reindex()
+            elif path == "/api/admin/rebuild-index":
+                self._admin_reindex()
+            elif path.startswith("/api/review"):
+                self._kikoeru_review_post(path, body)
+            elif path.startswith("/api/mylist"):
+                self._kikoeru_mylist_post(path, body)
+            else:
+                self._json({"error": "not found", "method": "POST", "path": path}, 404)
+        except BrokenPipeError:
+            pass
+        except Exception as e:
+            import traceback
+            sys.stderr.write("--- POST " + traceback.format_exc() + "\n")
+            self._json({"error": str(e), "type": type(e).__name__}, 500)
+
+    def _dispatch_delete(self):
+        url = urllib.parse.urlparse(self.path)
+        path = url.path
+        try:
+            try:
+                clen = int(self.headers.get("Content-Length", "0"))
+            except ValueError:
+                clen = 0
+            body = self.rfile.read(clen) if clen > 0 else b""
+            if path.startswith("/api/work/"):
+                self._api_delete_work(path[len("/api/work/"):].strip("/"), body)
+            elif path.startswith("/api/works/"):
+                self._api_delete_work(path[len("/api/works/"):].strip("/"), body)
+            else:
+                self._json({"error": "not found", "method": "DELETE", "path": path}, 404)
+        except BrokenPipeError:
+            pass
+        except Exception as e:
+            import traceback
+            sys.stderr.write("--- DELETE " + traceback.format_exc() + "\n")
+            self._json({"error": str(e), "type": type(e).__name__}, 500)
+
+    def _kikoeru_auth_me_post(self, body: bytes):
+        """Handle POST /api/auth/me (login submission)."""
+        # Parse the JSON body just to validate it's well-formed; we accept any creds.
+        try:
+            data = json.loads(body) if body else {}
+        except json.JSONDecodeError:
+            data = {}
+        self._json({
+            "token": "guest-token",
+            "user": {"id": 1, "name": data.get("name", "guest"), "group": "admin"},
+        })
+
+    def _kikoeru_review_post(self, path: str, body: bytes):
+        """Stub: accept reviews but don't persist."""
+        self._json({"ok": True, "review": None})
+
+    def _kikoeru_mylist_post(self, path: str, body: bytes):
+        """Stub: accept mylist updates but don't persist."""
+        self._json({"ok": True})
+
+    def _dispatch(self, head: bool = False):
+        url = urllib.parse.urlparse(self.path)
+        path = url.path
+        qs = urllib.parse.parse_qs(url.query)
+        try:
+            if path in ("/asmr-library", "/asmr-library/", "/dashboard", "/dashboard/"):
+                self._serve_asmr_library_dashboard(head=head)
+                return
+            if path == "/api/asmr-library/health":
+                self._json(get_dashboard_module().health(), head=head)
+                return
+            if path == "/api/asmr-library/library/summary":
+                self._json(get_dashboard_module().library_summary(), head=head)
+                return
+            if path == "/api/asmr-library/subtitles/missing":
+                summary = get_dashboard_module().library_summary()
+                self._json({"items": summary["missing_subtitles"]}, head=head)
+                return
+            if path.startswith("/api/asmr-library/work/"):
+                rj = urllib.parse.unquote(path.rsplit("/", 1)[-1])
+                self._json(get_dashboard_module().work_info(rj), head=head)
+                return
+            if path.startswith("/api/asmr-library/actions/"):
+                dash = get_dashboard_module()
+                action_id = path.rsplit("/", 1)[-1]
+                rec = dash.action_snapshot(action_id) if hasattr(dash, "action_snapshot") else None
+                if not rec:
+                    self._json({"error": "action not found"}, 404, head=head)
+                else:
+                    self._json(rec, head=head)
+                return
+            if path.rstrip("/") == "/api/tags":
+                self._kikoeru_relation_list("tag")
+                return
+            if path.startswith("/api/tags/") and path.endswith("/works"):
+                raw_id = path[len("/api/tags/"):-len("/works")].strip("/")
+                self._kikoeru_relation_works("tag", raw_id, qs)
+                return
+            if path.rstrip("/") == "/api/circles":
+                self._kikoeru_relation_list("circle")
+                return
+            if path.startswith("/api/circles/") and path.endswith("/works"):
+                raw_id = path[len("/api/circles/"):-len("/works")].strip("/")
+                self._kikoeru_relation_works("circle", raw_id, qs)
+                return
+            if path.rstrip("/") == "/api/vas":
+                self._kikoeru_relation_list("va")
+                return
+            if path.startswith("/api/vas/") and path.endswith("/works"):
+                raw_id = path[len("/api/vas/"):-len("/works")].strip("/")
+                self._kikoeru_relation_works("va", raw_id, qs)
+                return
+            if path == "/api/review":
+                self._kikoeru_empty_favourites(qs)
+                return
+            # Kikoeru-compatible routes (no auth, no admin pages)
+            if path == "/api/works":
+                self._kikoeru_works(qs)
+            elif path.startswith("/api/search/"):
+                qs2 = dict(qs)
+                qs2["keyword"] = [urllib.parse.unquote(path[len("/api/search/"):].strip("/"))]
+                self._kikoeru_works(qs2)
+            elif path.rstrip("/") == "/api/tags":
+                self._kikoeru_relation_list("tag")
+            elif path.startswith("/api/tags/") and path.endswith("/works"):
+                raw_id = path[len("/api/tags/"):-len("/works")].strip("/")
+                self._kikoeru_relation_works("tag", raw_id, qs)
+            elif path.startswith("/api/tags/"):
+                self._kikoeru_relation("tag", path[len("/api/tags/"):].strip("/"))
+            elif path.rstrip("/") == "/api/circles":
+                self._kikoeru_relation_list("circle")
+            elif path.startswith("/api/circles/") and path.endswith("/works"):
+                raw_id = path[len("/api/circles/"):-len("/works")].strip("/")
+                self._kikoeru_relation_works("circle", raw_id, qs)
+            elif path.startswith("/api/circles/"):
+                self._kikoeru_relation("circle", path[len("/api/circles/"):].strip("/"))
+            elif path.rstrip("/") == "/api/vas":
+                self._kikoeru_relation_list("va")
+            elif path.startswith("/api/vas/") and path.endswith("/works"):
+                raw_id = path[len("/api/vas/"):-len("/works")].strip("/")
+                self._kikoeru_relation_works("va", raw_id, qs)
+            elif path.startswith("/api/vas/"):
+                self._kikoeru_relation("va", path[len("/api/vas/"):].strip("/"))
+            elif path.startswith("/api/work/"):
+                self._kikoeru_work(path[len("/api/work/"):].strip("/"))
+            elif path.startswith("/api/tracks/"):
+                self._kikoeru_tracks(path[len("/api/tracks/"):].strip("/"))
+            elif path.startswith("/api/media/stream/"):
+                self._kikoeru_stream(path[len("/api/media/stream/"):].strip("/"), qs, head=head)
+            elif path.startswith("/api/media/download/"):
+                self._kikoeru_download(path[len("/api/media/download/"):].strip("/"), qs, head=head)
+            elif path.startswith("/api/covers/"):
+                self._kikoeru_cover(path[len("/api/covers/"):].strip("/"), head=head)
+            elif path.startswith("/api/media/check-lrc/"):
+                self._kikoeru_check_lrc(path[len("/api/media/check-lrc/"):].strip("/"))
+            elif path.startswith("/api/track/"):
+                self._kikoeru_track(path[len("/api/track/"):].strip("/"))
+            elif path == "/api/auth/me":
+                self._kikoeru_auth_me(qs)
+            elif path == "/api/version":
+                self._json({
+                    "version": "asmr-view/1.0",
+                    "kikoeru_compat": True,
+                    "update_available": False,
+                    "notifyUser": False,
+                    "lockFileExists": False,
+                })
+            elif path == "/api/config/shared":
+                self._kikoeru_config_shared()
+            elif path == "/api/mylist":
+                self._json({"mylists": []})
+            elif path == "/api/review":
+                self._kikoeru_empty_favourites(qs)
+            # Asmr-view-native routes
+            elif path in ("/", "/index.html"):
+                self._serve_spa(head=head)
+            elif path == "/api/health":
+                self._json({"ok": True, "works": self._count_works(), "covers": len(_COVER_CACHE)}, head=head)
+            elif path == "/api/files":
+                self._api_files(qs)
+            elif path.startswith("/api/cover/"):
+                self._api_cover(path[len("/api/cover/"):].strip("/"), head=head)
+            elif path.startswith("/api/stream/"):
+                self._api_stream(path[len("/api/stream/"):].strip("/"))
+            elif path.startswith("/api/duration/"):
+                self._api_duration(path[len("/api/duration/"):].strip("/"))
+            # Admin / build
+            elif path == "/api/admin/reindex":
+                self._admin_reindex()
+            elif path == "/api/admin/rebuild-index":
+                self._admin_reindex()
+            # Kikoeru-quasar SPA assets (if built)
+            elif path == "/favicon.ico":
+                self._serve_no_img()
+            # Static assets for the kikoeru SPA: /js/*, /css/*, /fonts/*, /statics/*
+            elif (
+                path.startswith("/js/") or path.startswith("/css/")
+                or path.startswith("/fonts/") or path.startswith("/statics/")
+            ):
+                self._serve_spa_static(path)
+            # SPA history fallback: any other non-/api GET that doesn't look like
+            # a file (no extension) -> serve the SPA shell so vue-router can take
+            # over. This handles direct hits like /work/1010222, /library, etc.
+            elif "." not in os.path.basename(path.rstrip("/")):
+                self._serve_spa(head=head)
+            else:
+                self._json({"error": "not found", "path": path}, 404, head=head)
+        except BrokenPipeError:
+            pass
+        except Exception as e:
+            import traceback
+            sys.stderr.write("--- " + traceback.format_exc() + "\n")
+            self._json({"error": str(e), "type": type(e).__name__}, 500, head=head)
+
+    # ----- SPA + static -----
+    def _serve_spa(self, head: bool = False):
+        # Prefer the built kikoeru-quasar SPA if present, else fall back
+        # to the hand-rolled SPA.
+        if (KIKOERU_SPA_DIR / "index.html").is_file():
+            base = KIKOERU_SPA_DIR
+        else:
+            base = VIEW_DIR
+        idx = base / "index.html"
+        if not idx.is_file():
+            self._json({"error": "SPA not built", "expected": str(idx)}, 503)
+            return
+        body = idx.read_bytes()
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        # Don't cache the SPA shell so updates are picked up
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        if not head:
+            self.wfile.write(body)
+
+    def _serve_asmr_library_dashboard(self, head: bool = False):
+        dash = get_dashboard_module()
+        html = dash.INDEX_HTML
+        html = html.replace("/api/health", "/api/asmr-library/health")
+        html = html.replace("/api/library/summary", "/api/asmr-library/library/summary")
+        html = html.replace("/api/subtitles/missing", "/api/asmr-library/subtitles/missing")
+        html = html.replace("/api/work/", "/api/asmr-library/work/")
+        html = html.replace("/api/actions/", "/api/asmr-library/actions/")
+        body = html.encode("utf-8")
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        if not head:
+            self.wfile.write(body)
+
+    def _serve_no_img(self):
+        if not NEOKIKOERU_NO_IMG.is_file():
+            self._json({"error": "no_img missing"}, 404)
+            return
+        body = NEOKIKOERU_NO_IMG.read_bytes()
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "image/gif")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _serve_spa_static(self, path: str):
+        """Serve /js/*, /css/*, /fonts/*, /statics/* from the built kikoeru SPA.
+
+        Refuses anything that tries to escape the SPA root.
+        """
+        if not KIKOERU_SPA_DIR.is_dir():
+            self._json({"error": "kikoeru SPA not built"}, 404)
+            return
+        # Strip the leading slash and normalize; reject any traversal attempts.
+        rel = path.lstrip("/")
+        if not rel or ".." in rel.split("/"):
+            self._json({"error": "bad path"}, 400)
+            return
+        target = (KIKOERU_SPA_DIR / rel).resolve()
+        try:
+            target.relative_to(KIKOERU_SPA_DIR.resolve())
+        except ValueError:
+            self._json({"error": "path escapes SPA root"}, 400)
+            return
+        if not target.is_file():
+            self._json({"error": "asset not found", "path": rel}, 404)
+            return
+        ctype, _ = mimetypes.guess_type(target.name)
+        if not ctype:
+            ctype = "application/octet-stream"
+        body = target.read_bytes()
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        # Hashed asset filenames are immutable; cache aggressively.
+        self.send_header("Cache-Control", "public, max-age=31536000, immutable")
+        self.end_headers()
+        self.wfile.write(body)
+
+    # ----- API -----
+    def _api_works(self, qs: dict):
+        try:
+            page = int(qs.get("page", ["1"])[0])
+            size = min(int(qs.get("size", ["24"])[0]), 200)
+        except ValueError:
+            self._json({"error": "page/size must be int"}, 400)
+            return
+        search = ""
+        for key in ("search", "q", "keyword", "tag", "label", "circle", "maker", "va", "artist"):
+            value = qs.get(key, [""])[0].strip()
+            if value:
+                search = value
+                break
+        self._json(list_works(page, size, search))
+
+    def _api_work(self, rj: str):
+        if not re.match(r"^RJ\d+$", rj):
+            self._json({"error": "invalid rj id"}, 400)
+            return
+        data = get_work(rj)
+        if data is None:
+            self._json({"error": "work not found", "rj": rj}, 404)
+            return
+        self._json(data)
+
+    def _api_files(self, qs: dict):
+        rj = qs.get("rj", [""])[0]
+        path = qs.get("path", [""])[0]
+        if not re.match(r"^RJ\d+$", rj):
+            self._json({"error": "invalid rj id"}, 400)
+            return
+        result = list_files(rj, path)
+        if isinstance(result, tuple):
+            self._json(result[0], result[1])
+        else:
+            self._json(result)
+
+    def _api_cover(self, rj: str, head: bool = False):
+        # Accept either "RJ01010222" (canonical), "1010222" (kikoeru
+        # numeric), or a track hash (e.g. "HxAEz8E49q4") — kikoeru's
+        # AudioPlayer uses the file hash because that's what's in
+        # the queue, while the WorkPage uses the work id directly.
+        # Look up the file's work if we get a hash, then resolve
+        # the work's cover.
+        db = get_db()
+        if re.match(r"^RJ\d+$", rj.upper()):
+            rj_canon = rj.upper()
+        elif re.match(r"^\d+$", rj):
+            # Look up the actual RJ code (handles both 6-digit and 8-digit forms).
+            rj_canon = _kikoeru.resolve_rj(db, int(rj))
+            if rj_canon is None:
+                self._serve_no_img()
+                return
+        else:
+            # Probably a track hash — look up the file row and use
+            # its work_id to find the cover.
+            row = db.execute(
+                "SELECT work_id FROM files WHERE id = ?", (rj,)
+            ).fetchone()
+            if row is None or not row["work_id"]:
+                self._serve_no_img()
+                return
+            rj_canon = row["work_id"]
+        rj = rj_canon
+        path = resolve_cover(rj)
+        if path is None:
+            path = NEOKIKOERU_NO_IMG if NEOKIKOERU_NO_IMG.is_file() else None
+        if path is None or not path.is_file():
+            self._json({"error": "cover not found", "rj": rj}, 404, head=head)
+            return
+        ctype, _ = mimetypes.guess_type(str(path))
+        if ctype is None:
+            ctype = "image/jpeg"
+        body = path.read_bytes()
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-cache, max-age=0")
+        self.end_headers()
+        if not head:
+            self.wfile.write(body)
+
+    def _api_stream(self, file_id: str):
+        conn = get_db()
+        row = conn.execute(
+            "SELECT name, work_id, path FROM files WHERE id = ?",
+            (file_id,),
+        ).fetchone()
+        if row is None:
+            self._json({"error": "file not found"}, 404)
+            return
+        rel_path = row["path"]
+        if rel_path and rel_path.startswith("/"):
+            real = get_storage_root() / rel_path.lstrip("/")
+        else:
+            real = get_storage_root() / (rel_path or "")
+        if real.is_file():
+            self._serve_file_range(real, head=False)
+            return
+        # Fallback: Neokikoeru proxy
+        token = get_token()
+        if not token:
+            self._json({"error": f"file missing on disk and no neo token ({real} not found)"}, 503)
+            return
+        port = get_neo_port()
+        upstream = (
+            f"http://127.0.0.1:{port}/api/v1/fs/download"
+            f"?file_id={urllib.parse.quote(file_id)}&token={urllib.parse.quote(token)}"
+        )
+        fwd_headers = {"User-Agent": "asmr-view/1.0"}
+        rng = self.headers.get("Range")
+        if rng:
+            fwd_headers["Range"] = rng
+        try:
+            req = urllib.request.Request(upstream, headers=fwd_headers)
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                status = resp.status
+                ctype = resp.headers.get("Content-Type", "application/octet-stream")
+                clen = resp.headers.get("Content-Length")
+                crange = resp.headers.get("Content-Range")
+                self.send_response(status)
+                self.send_header("Content-Type", ctype)
+                if clen:
+                    self.send_header("Content-Length", clen)
+                if crange:
+                    self.send_header("Content-Range", crange)
+                self.send_header("Accept-Ranges", "bytes")
+                self.send_header("Cache-Control", "public, max-age=3600")
+                self.end_headers()
+                while True:
+                    chunk = resp.read(64 * 1024)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+        except urllib.error.HTTPError as he:
+            try:
+                err_body = he.read()
+            except Exception:
+                err_body = b""
+            self.send_response(he.code)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", str(len(err_body)))
+            self.end_headers()
+            self.wfile.write(err_body)
+        except Exception as e:
+            self._json({"error": f"upstream failed: {e}"}, 502)
+
+    def _api_duration(self, file_id: str):
+        conn = get_db()
+        row = conn.execute(
+            "SELECT id, name, duration FROM files WHERE id = ?",
+            (file_id,),
+        ).fetchone()
+        if row is None:
+            self._json({"error": "file not found"}, 404)
+            return
+        self._json({
+            "id": row["id"],
+            "name": row["name"],
+            "duration": float(row["duration"] or 0),
+        })
+
+    def _count_works(self) -> int:
+        return get_db().execute("SELECT COUNT(*) FROM works").fetchone()[0]
+
+    def _json(self, data, status: int = 200, head: bool = False):
+        body = json.dumps(data, ensure_ascii=False, default=str).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        if head:
+            self.end_headers()
+        else:
+            self.end_headers()
+            self.wfile.write(body)
+
+    # -----------------------------------------------------------------------
+    # Kikoeru-compatible API handlers
+    # -----------------------------------------------------------------------
+    def _kikoeru_works(self, qs: dict):
+        try:
+            page = int(qs.get("page", ["1"])[0])
+            size = int(qs.get("size", ["12"])[0])
+        except ValueError:
+            page, size = 1, 12
+        size = min(max(size, 1), 200)
+        search = ""
+        for key in ("keyword", "search", "q", "tag", "label", "circle", "maker", "va", "artist"):
+            value = qs.get(key, [""])[0].strip()
+            if value:
+                search = value
+                break
+        # Sort / order — kikoeru-quasar SPA sends these as
+        # `order=<key>&sort=<asc|desc>&seed=<int>`. Whitelisting is
+        # done in list_works; anything weird falls through to a
+        # safe default.
+        order = (qs.get("order", ["id"])[0] or "id").strip()
+        sort = (qs.get("sort", ["desc"])[0] or "desc").strip()
+        try:
+            seed = int(qs.get("seed", ["0"])[0])
+        except ValueError:
+            seed = 0
+        data = list_works(page=page, size=size, search=search, order=order, sort=sort, seed=seed)
+        self._json(data)
+
+    def _kikoeru_relation(self, relation: str, raw_id: str):
+        detail = relation_detail(relation, raw_id)
+        if detail is None:
+            self._json({"error": "relation not found", "type": relation, "id": raw_id}, 404)
+            return
+        self._json(detail)
+
+    def _kikoeru_relation_list(self, relation: str):
+        items = relation_list(relation)
+        self._json(items)
+
+    def _kikoeru_empty_favourites(self, qs: dict):
+        try:
+            page = int(qs.get("page", ["1"])[0])
+        except ValueError:
+            page = 1
+        self._json({
+            "pagination": {"totalCount": 0, "currentPage": page, "pageSize": 12},
+            "page": page,
+            "size": 12,
+            "total": 0,
+            "works": [],
+            "reviews": [],
+        })
+
+    def _kikoeru_relation_works(self, relation: str, raw_id: str, qs: dict):
+        try:
+            page = int(qs.get("page", ["1"])[0])
+            size = int(qs.get("size", ["12"])[0])
+        except ValueError:
+            page, size = 1, 12
+        size = min(max(size, 1), 200)
+        order = (qs.get("order", ["id"])[0] or "id").strip()
+        sort = (qs.get("sort", ["desc"])[0] or "desc").strip()
+        try:
+            seed = int(qs.get("seed", ["0"])[0])
+        except ValueError:
+            seed = 0
+        self._json(list_works_by_relation(relation, raw_id, page, size, order, sort, seed))
+
+    def _kikoeru_work(self, raw_id: str):
+        try:
+            wid = _kikoeru.to_work_id(raw_id)
+        except ValueError:
+            self._json({"error": "bad work id", "id": raw_id}, 400)
+            return
+        rj = _kikoeru.resolve_rj(get_db(), wid)
+        if rj is None:
+            self._json({"error": "work not found", "id": wid}, 404)
+            return
+        work = get_work(rj)
+        if work is None:
+            self._json({"error": "work not found", "id": wid}, 404)
+            return
+        self._json(work)
+
+    def _kikoeru_tracks(self, raw_id: str):
+        try:
+            wid = _kikoeru.to_work_id(raw_id)
+        except ValueError:
+            self._json({"error": "bad work id", "id": raw_id}, 400)
+            return
+        rj = _kikoeru.resolve_rj(get_db(), wid)
+        if rj is None:
+            self._json({"error": "work not found", "id": wid}, 404)
+            return
+        tree = _kikoeru.build_tree(get_db(), rj)
+        self._json(tree)
+
+    def _kikoeru_stream(self, file_hash: str, qs: dict, head: bool = False):
+        """Stream a file from disk (or proxy via Neokikoeru).
+
+        Resolution order:
+          1. Look up `files.path` in the DB. Path is stored as e.g.
+             ``/RJ01010222/...mp3``; prepend the storage root
+             (default ~/ASMR) to get the real file.
+          2. If the file exists on disk, stream it directly with full
+             HTTP Range support so the player can seek.
+          3. Fall back to Neokikoeru's unencrypted /fs/download proxy
+             (works without a license) if the disk copy is missing.
+
+        Subtitle / text files (lrc/vtt/srt/ass/ssa/txt) are served as
+        ``text/plain; charset=<detected>``:
+          * .lrc is served as-is (the kikoeru client's
+            ``lrc-file-parser`` consumes it directly).
+          * .vtt / .srt / .ass / .ssa are converted to LRC on the
+            fly so the player can display them as active lyrics.
+            ``.txt`` is served as-is (text file, not a lyric).
+        """
+        conn = get_db()
+        row = conn.execute(
+            "SELECT name, work_id, path, size FROM files WHERE id = ?",
+            (file_hash,),
+        ).fetchone()
+        if row is None:
+            self._json({"error": "file not found"}, 404)
+            return
+        rel_path = row["path"]
+        if rel_path and rel_path.startswith("/"):
+            real = get_storage_root() / rel_path.lstrip("/")
+        else:
+            real = get_storage_root() / (rel_path or "")
+        if real.is_file():
+            suffix = real.suffix.lower()
+            # Subtitle files (lyric-capable): LRC is pass-through, the
+            # rest are converted to LRC on the fly.
+            if suffix in (".lrc", ".vtt", ".srt", ".ass", ".ssa"):
+                charset = _kikoeru.detect_text_charset(real)
+                ctype = f"text/plain; charset={charset}"
+                if head:
+                    # Compute the post-conversion body size so the
+                    # Content-Length matches what the GET will return.
+                    try:
+                        raw = real.read_bytes()
+                    except OSError:
+                        raw = b""
+                    if charset == "utf-8":
+                        text = raw.decode("utf-8", errors="replace")
+                    elif charset == "utf-16":
+                        text = raw.decode("utf-16", errors="replace")
+                    elif charset == "gbk":
+                        text = raw.decode("gbk", errors="replace")
+                    else:
+                        text = raw.decode("utf-8", errors="replace")
+                    try:
+                        lrc_text = _kikoeru.convert_subtitle_to_lrc(text, suffix)
+                        body_len = len(lrc_text.encode("utf-8"))
+                    except ValueError:
+                        body_len = len(raw)
+                    self.send_response(HTTPStatus.OK)
+                    self.send_header("Content-Type", ctype)
+                    self.send_header("Accept-Ranges", "none")
+                    self.send_header("Cache-Control", "public, max-age=3600")
+                    self.send_header("Content-Length", str(body_len))
+                    self.end_headers()
+                    return
+                try:
+                    raw = real.read_bytes()
+                except OSError as e:
+                    self._json({"error": f"read failed: {e}"}, 500)
+                    return
+                # Decode using detected charset. We always re-encode as
+                # UTF-8 — the player's lrc-file-parser expects UTF-8.
+                if charset == "utf-8":
+                    text = raw.decode("utf-8", errors="replace")
+                elif charset == "utf-16":
+                    text = raw.decode("utf-16", errors="replace")
+                elif charset == "gbk":
+                    text = raw.decode("gbk", errors="replace")
+                else:
+                    text = raw.decode("utf-8", errors="replace")
+                try:
+                    lrc_text = _kikoeru.convert_subtitle_to_lrc(text, suffix)
+                except ValueError:
+                    # Unsupported format — fall back to raw bytes.
+                    body = raw
+                else:
+                    body = lrc_text.encode("utf-8")
+                self.send_response(HTTPStatus.OK)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Accept-Ranges", "none")
+                self.send_header("Cache-Control", "public, max-age=3600")
+                self.end_headers()
+                try:
+                    self.wfile.write(body)
+                except (BrokenPipeError, ConnectionResetError):
+                    return
+                return
+            # Plain text files: serve as text/plain, raw bytes.
+            if suffix == ".txt":
+                charset = _kikoeru.detect_text_charset(real)
+                ctype = f"text/plain; charset={charset}"
+                try:
+                    body = real.read_bytes()
+                except OSError as e:
+                    self._json({"error": f"read failed: {e}"}, 500)
+                    return
+                self.send_response(HTTPStatus.OK)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Accept-Ranges", "none")
+                self.send_header("Cache-Control", "public, max-age=3600")
+                self.end_headers()
+                try:
+                    self.wfile.write(body)
+                except (BrokenPipeError, ConnectionResetError):
+                    return
+                return
+            # Regular audio: stream with Range support.
+            self._serve_file_range(real, content_type=None, head=head)
+            return
+        # Fallback: proxy via Neokikoeru
+        token = get_token()
+        if not token:
+            self._json({"error": f"file missing on disk and no neo token ({real} not found)"}, 503)
+            return
+        port = get_neo_port()
+        upstream = (
+            f"http://127.0.0.1:{port}/api/v1/fs/download"
+            f"?file_id={urllib.parse.quote(file_hash)}&token={urllib.parse.quote(token)}"
+        )
+        fwd_headers = {"User-Agent": "asmr-view/1.0"}
+        rng = self.headers.get("Range")
+        if rng:
+            fwd_headers["Range"] = rng
+        try:
+            req = urllib.request.Request(upstream, headers=fwd_headers)
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                status = resp.status  # 200 or 206
+                ctype = resp.headers.get("Content-Type", "application/octet-stream")
+                clen = resp.headers.get("Content-Length")
+                crange = resp.headers.get("Content-Range")
+                accept_ranges = resp.headers.get("Accept-Ranges", "bytes")
+                self.send_response(status)
+                self.send_header("Content-Type", ctype)
+                if clen:
+                    self.send_header("Content-Length", clen)
+                if crange:
+                    self.send_header("Content-Range", crange)
+                self.send_header("Accept-Ranges", accept_ranges)
+                self.send_header("Cache-Control", "public, max-age=3600")
+                self.end_headers()
+                if not head:
+                    while True:
+                        chunk = resp.read(64 * 1024)
+                        if not chunk:
+                            break
+                        self.wfile.write(chunk)
+        except urllib.error.HTTPError as he:
+            try:
+                err_body = he.read()
+            except Exception:
+                err_body = b""
+            self.send_response(he.code)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", str(len(err_body)))
+            self.end_headers()
+            if not head:
+                self.wfile.write(err_body)
+        except Exception as e:
+            self._json({"error": f"upstream failed: {e}"}, 502)
+
+    def _serve_file_range(self, path: Path, content_type: str | None = None,
+                            head: bool = False, attachment_name: str | None = None):
+        """Serve a file with HTTP Range support and Content-Disposition.
+
+        Used by /api/media/stream and /api/media/download. path is
+        guaranteed to be an existing file when this is called.
+        """
+        try:
+            file_size = path.stat().st_size
+        except OSError as e:
+            self._json({"error": f"stat failed: {e}"}, 500)
+            return
+        if not content_type:
+            ctype, _ = mimetypes.guess_type(str(path))
+            ctype = ctype or "application/octet-stream"
+        rng = self.headers.get("Range")
+        start, end = 0, file_size - 1
+        status = HTTPStatus.OK
+        if rng:
+            m = re.match(r"bytes=(\d*)-(\d*)$", rng.strip())
+            if not m:
+                self.send_response(HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE)
+                self.send_header("Content-Range", f"bytes */{file_size}")
+                self.end_headers()
+                return
+            s, e = m.group(1), m.group(2)
+            if s == "" and e == "":
+                self.send_response(HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE)
+                self.send_header("Content-Range", f"bytes */{file_size}")
+                self.end_headers()
+                return
+            if s == "":
+                # suffix range: last N bytes
+                suffix_len = int(e)
+                if suffix_len == 0:
+                    self.send_response(HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE)
+                    self.send_header("Content-Range", f"bytes */{file_size}")
+                    self.end_headers()
+                    return
+                start = max(0, file_size - suffix_len)
+                end = file_size - 1
+            else:
+                start = int(s)
+                end = int(e) if e else file_size - 1
+            if start > end or start >= file_size:
+                self.send_response(HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE)
+                self.send_header("Content-Range", f"bytes */{file_size}")
+                self.end_headers()
+                return
+            status = HTTPStatus.PARTIAL_CONTENT
+        length = end - start + 1
+        self.send_response(status)
+        self.send_header("Content-Type", content_type or ctype)
+        self.send_header("Content-Length", str(length))
+        if status == HTTPStatus.PARTIAL_CONTENT:
+            self.send_header("Content-Range", f"bytes {start}-{end}/{file_size}")
+        self.send_header("Accept-Ranges", "bytes")
+        if attachment_name:
+            encoded = urllib.parse.quote(attachment_name, safe="")
+            self.send_header(
+                "Content-Disposition",
+                f"attachment; filename=\"download\"; filename*=UTF-8''{encoded}",
+            )
+        else:
+            self.send_header("Cache-Control", "public, max-age=3600")
+        self.end_headers()
+        if head:
+            return
+        # Stream in chunks
+        with open(path, "rb") as f:
+            if start > 0:
+                f.seek(start)
+            remaining = length
+            chunk_size = 64 * 1024
+            while remaining > 0:
+                chunk = f.read(min(chunk_size, remaining))
+                if not chunk:
+                    break
+                try:
+                    self.wfile.write(chunk)
+                except (BrokenPipeError, ConnectionResetError):
+                    return
+                remaining -= len(chunk)
+
+    def _kikoeru_download(self, file_hash: str, qs: dict, head: bool = False):
+        """Download a file (with Content-Disposition: attachment).
+
+        Tries the real disk file first; falls back to Neokikoeru proxy.
+        """
+        conn = get_db()
+        row = conn.execute(
+            "SELECT name, work_id, path FROM files WHERE id = ?",
+            (file_hash,),
+        ).fetchone()
+        if row is None:
+            self._json({"error": "file not found"}, 404)
+            return
+        rel_path = row["path"]
+        if rel_path and rel_path.startswith("/"):
+            real = get_storage_root() / rel_path.lstrip("/")
+        else:
+            real = get_storage_root() / (rel_path or "")
+        if real.is_file():
+            self._serve_file_range(real, head=head, attachment_name=row["name"])
+            return
+        # Fallback: Neokikoeru
+        token = get_token()
+        if not token:
+            self._json({"error": f"file missing on disk and no neo token ({real} not found)"}, 503)
+            return
+        port = get_neo_port()
+        upstream = (
+            f"http://127.0.0.1:{port}/api/v1/fs/download"
+            f"?file_id={urllib.parse.quote(file_hash)}&token={urllib.parse.quote(token)}"
+        )
+        try:
+            req = urllib.request.Request(upstream, headers={"User-Agent": "asmr-view/1.0"})
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                ctype = resp.headers.get("Content-Type", "application/octet-stream")
+                clen = resp.headers.get("Content-Length")
+                filename = row["name"]
+                encoded = urllib.parse.quote(filename, safe="")
+                self.send_response(HTTPStatus.OK)
+                self.send_header("Content-Type", ctype)
+                if clen:
+                    self.send_header("Content-Length", clen)
+                self.send_header(
+                    "Content-Disposition",
+                    f"attachment; filename=\"download\"; filename*=UTF-8''{encoded}",
+                )
+                self.end_headers()
+                if not head:
+                    while True:
+                        chunk = resp.read(64 * 1024)
+                        if not chunk:
+                            break
+                        self.wfile.write(chunk)
+        except Exception as e:
+            self._json({"error": f"upstream failed: {e}"}, 502)
+
+    def _kikoeru_cover(self, raw_id: str, head: bool = False):
+        # accept both numeric and "RJ..." forms
+        try:
+            wid = _kikoeru.to_work_id(raw_id)
+        except ValueError:
+            # Maybe a track hash was passed (kikoeru's WorkPage asks for
+            # /api/cover/<hash> for tracks too). Fall back to the no_img
+            # placeholder so the player UI doesn't break.
+            if re.match(r"^[-_a-zA-Z0-9]+$", raw_id):
+                self._serve_no_img()
+            else:
+                self._json({"error": "bad work id", "id": raw_id}, 400)
+            return
+        rj = _kikoeru.resolve_rj(get_db(), wid)
+        if rj is None:
+            # No such work — show placeholder rather than 404 so the page
+            # layout doesn't break.
+            self._serve_no_img()
+            return
+        self._api_cover(rj, head=head)
+
+    def _kikoeru_check_lrc(self, audio_hash: str):
+        """Kikoeru AudioElement polls this to find a sibling .lrc file.
+
+        Kikoeru's loadLrcFile checks `response.data.result` (truthy = has
+        lyrics) and then uses `response.data.hash` to fetch the lrc.
+        We return {result: bool, hash: <lrc_hash_or_null>}.
+        """
+        conn = get_db()
+        row = conn.execute("SELECT work_id FROM files WHERE id = ?", (audio_hash,)).fetchone()
+        if row is None:
+            self._json({"result": False, "hash": None})
+            return
+        lrc_hash = _kikoeru.find_lrc_for_audio(conn, row["work_id"], audio_hash)
+        if lrc_hash:
+            self._json({"result": True, "hash": lrc_hash})
+        else:
+            self._json({"result": False, "hash": None})
+
+    def _kikoeru_track(self, file_hash: str):
+        """Single file metadata — kikoeru uses this for queue items."""
+        conn = get_db()
+        row = conn.execute(
+            "SELECT id, name, size, duration, is_folder, path, work_id FROM files WHERE id = ?",
+            (file_hash,),
+        ).fetchone()
+        if row is None:
+            self._json({"error": "file not found"}, 404)
+            return
+        is_folder = bool(row["is_folder"])
+        name = row["name"]
+        try:
+            wid = _kikoeru.rj_to_numeric(row["work_id"])
+        except Exception:
+            wid = 0
+        out = {
+            "hash": row["id"],
+            "title": name,
+            "type": "folder" if is_folder else _kikoeru._classify(name),
+            "children": [],
+            "mediaStreamUrl": f"/api/media/stream/{row['id']}" if not is_folder else None,
+            "mediaDownloadUrl": f"/api/media/download/{row['id']}" if not is_folder else None,
+            "work_id": wid,
+            "work_name": "",
+            "size": int(row["size"] or 0),
+            "duration": float(row["duration"] or 0),
+        }
+        self._json(out)
+
+    def _kikoeru_auth_me(self, qs: dict):
+        """Mock auth: no login required, return a fake admin user.
+
+        kikoeru's MainLayout does GET /api/auth/me and expects:
+          { user: {...}, auth: true }
+        Login.vue does POST /api/auth/me with {name, password} and expects:
+          { token: "..." }
+        Without real auth, we always return a guest admin user with a
+        static token. The axios boot file sets
+        `Authorization: Bearer <token>` from localStorage.
+        """
+        token = qs.get("token", [""])[0] or "guest-token"
+        if self.command == "POST":
+            # Login submission — accept any creds, return token
+            self._json({
+                "token": token,
+                "user": {"id": 1, "name": "guest", "group": "admin"},
+            })
+        else:
+            # Auth check
+            self._json({
+                "user": {"id": 1, "name": "guest", "group": "admin"},
+                "auth": True,
+            })
+
+    def _kikoeru_config_shared(self):
+        """Shared config — kikoeru reads .sharedConfig.name and .sharedConfig.user.* fields."""
+        self._json({
+            "sharedConfig": {
+                "name": "asmr-view",
+                "user": {"id": 1, "name": "guest", "group": "admin"},
+                "title": "asmr-view (kikoeru-quasar compat)",
+                "source_url": "https://github.com/kikoeru-project/kikoeru-quasar",
+            }
+        })
+
+    def _safe_child_path(self, root: Path, rel: str) -> Path | None:
+        parts = [part for part in rel.replace("\\", "/").lstrip("/").split("/") if part]
+        if not parts or ".." in parts:
+            return None
+        target = (root / Path(*parts)).resolve()
+        try:
+            target.relative_to(root.resolve())
+        except ValueError:
+            return None
+        return target
+
+    def _delete_path_permanently(self, path: Path) -> bool:
+        if path.is_dir():
+            shutil.rmtree(path)
+            return True
+        if path.is_file() or path.is_symlink():
+            path.unlink()
+            return True
+        return False
+
+    def _run_reindex_command(self) -> dict:
+        cmd = [str(HERMES_ASMR / "bin" / "asmr-library"), "build"]
+        proc = subprocess.run(
+            cmd,
+            cwd=str(HERMES_ASMR),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=1800,
+            env={
+                **os.environ,
+                "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+            },
+        )
+        try:
+            close_read_db()
+            build_cover_cache()
+        except Exception as e:
+            return {
+                "ok": False,
+                "returncode": proc.returncode,
+                "output": (proc.stdout or "")[-8000:],
+                "cache_error": str(e),
+            }
+        return {
+            "ok": proc.returncode == 0,
+            "returncode": proc.returncode,
+            "output": (proc.stdout or "")[-8000:],
+        }
+
+    def _api_delete_work(self, raw_id: str, body: bytes):
+        if not self._require_dashboard_admin(allow_loopback=False):
+            return
+        try:
+            wid = _kikoeru.to_work_id(raw_id)
+        except ValueError:
+            self._json({"error": "bad work id", "id": raw_id}, 400)
+            return
+        rj = _kikoeru.resolve_rj(get_db(), wid)
+        if rj is None:
+            self._json({"error": "work not found", "id": wid}, 404)
+            return
+        try:
+            payload = json.loads(body.decode("utf-8")) if body else {}
+        except json.JSONDecodeError:
+            self._json({"error": "invalid json body"}, 400)
+            return
+        confirmation = str(payload.get("confirmation", "")).strip().upper()
+        if confirmation != rj.upper():
+            self._json({"error": f"type {rj} to permanently delete this work", "rj": rj}, 400)
+            return
+
+        storage_root = get_storage_root().resolve()
+        conn_ro = get_db()
+        work = conn_ro.execute(
+            "SELECT id, name, image_main, image_thumb FROM works WHERE id = ?",
+            (rj,),
+        ).fetchone()
+        if work is None:
+            self._json({"error": "work not found", "rj": rj}, 404)
+            return
+        file_rows = conn_ro.execute(
+            "SELECT path FROM files WHERE work_id = ? ORDER BY LENGTH(path)",
+            (rj,),
+        ).fetchall()
+
+        media_targets: set[Path] = set()
+        for row in file_rows:
+            parts = [part for part in str(row["path"]).replace("\\", "/").lstrip("/").split("/") if part]
+            if not parts:
+                continue
+            top = parts[0]
+            if not top.upper().startswith("RJ"):
+                continue
+            target = self._safe_child_path(storage_root, top)
+            if target is not None:
+                media_targets.add(target)
+        fallback_target = self._safe_child_path(storage_root, rj)
+        if fallback_target is not None and fallback_target.exists():
+            media_targets.add(fallback_target)
+
+        cover_targets: set[Path] = set()
+        for key in ("image_main", "image_thumb"):
+            rel = work[key]
+            if rel:
+                target = self._safe_child_path(NEOKIKOERU_COVERS_ROOT, rel)
+                if target is not None:
+                    cover_targets.add(target)
+        cached = _COVER_CACHE.get(rj, {})
+        cover_targets.update(path for path in cached.values() if path and path.exists())
+
+        deleted_paths = []
+        for target in sorted(media_targets | cover_targets, key=lambda p: len(str(p)), reverse=True):
+            if self._delete_path_permanently(target):
+                deleted_paths.append(str(target))
+
+        close_read_db()
+        with get_write_db() as conn:
+            for table in ("artist_works", "illustrator_works", "genre_works", "histories", "likes", "files"):
+                conn.execute(f"DELETE FROM {table} WHERE work_id = ?", (rj,))
+            conn.execute("DELETE FROM works WHERE id = ?", (rj,))
+            conn.commit()
+
+        reindex = self._run_reindex_command()
+        self._json({
+            "ok": True,
+            "rj": rj,
+            "title": work["name"],
+            "deleted_paths": deleted_paths,
+            "deleted_path_count": len(deleted_paths),
+            "reindex_ok": reindex.get("ok"),
+            "reindex": reindex,
+        }, 200)
+
+    def _admin_reindex(self):
+        """Trigger metadata/cover reindex only, then refresh our cache."""
+        cmd = [str(HERMES_ASMR / "bin" / "asmr-library"), "reindex"]
+        poll_cmd = [str(HERMES_ASMR / "bin" / "asmr-library"), "serve", "tasks"]
+        try:
+            proc = subprocess.run(
+                cmd,
+                cwd=str(HERMES_ASMR),
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                timeout=120,
+                env={
+                    **os.environ,
+                    "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+                },
+            )
+            task_output = ""
+            if proc.returncode == 0:
+                # NeoKikoeru's DLsite metadata scan is async. Wait briefly so
+                # cover fields are populated before rebuilding /api/covers.
+                deadline = time.monotonic() + 240
+                while True:
+                    task_proc = subprocess.run(
+                        poll_cmd,
+                        cwd=str(HERMES_ASMR),
+                        text=True,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                        timeout=30,
+                        env={
+                            **os.environ,
+                            "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+                        },
+                    )
+                    task_output = task_proc.stdout[-8000:]
+                    lowered = task_output.lower()
+                    if "running" not in lowered and "pending" not in lowered and "queued" not in lowered:
+                        break
+                    if time.monotonic() >= deadline:
+                        break
+                    time.sleep(3)
+            results = {
+                "command": cmd,
+                "exit_code": proc.returncode,
+                "output": proc.stdout[-8000:],
+                "cover_metadata_tasks": task_output,
+            }
+            ok = proc.returncode == 0
+        except subprocess.TimeoutExpired as e:
+            results = {
+                "command": cmd,
+                "exit_code": 124,
+                "error": "asmr-library build timed out",
+                "output": ((e.stdout or "") + (e.stderr or ""))[-8000:],
+            }
+            ok = False
+        except Exception as e:
+            results = {"command": cmd, "error": str(e)}
+            ok = False
+        # Refresh our cover cache since reindex may have added files
+        build_cover_cache()
+        self._json({"ok": ok, "results": results, "covers": len(_COVER_CACHE)}, 200 if ok else 503)
+
+
+    # ---------------------------------------------------------------------------
+    # CLI
+    # ---------------------------------------------------------------------------
+
+def cmd_start(args):
+    host = args.host
+    port = args.port
+    try:
+        build_cover_cache()
+    except Exception as e:
+        import traceback
+        print(f"build_cover_cache FAILED: {e}")
+        traceback.print_exc()
+        sys.exit(1)
+    if PID_PATH.exists():
+        try:
+            pid = int(PID_PATH.read_text().strip())
+            os.kill(pid, 0)
+            print(f"already running (pid {pid}) on http://{host}:{port}")
+            return
+        except (OSError, ValueError):
+            PID_PATH.unlink(missing_ok=True)
+    # Use subprocess.Popen with start_new_session=True to fully
+    # detach from the controlling terminal. This is more reliable
+    # on macOS than os.fork + os.setsid because the child is
+    # launched as a brand new top-level process, not a fork of the
+    # current shell lineage.
+    log_fp = open(LOG_PATH, "ab")
+    # Build a re-exec command. We can't import from a running module
+    # easily, so re-exec the same script with the special
+    # `_serve_foreground` subcommand that bypasses the fork.
+    import subprocess
+    proc = subprocess.Popen(
+        [
+            sys.executable,
+            __file__,
+            "--host", host,
+            "--port", str(port),
+            "_serve_foreground",
+        ],
+        stdin=subprocess.DEVNULL,
+        stdout=log_fp,
+        stderr=log_fp,
+        start_new_session=True,
+        close_fds=True,
+    )
+    log_fp.close()
+    pid = proc.pid
+    # 0.0.0.0 is not a valid target for health check; use 127.0.0.1
+    check_host = "127.0.0.1" if host == "0.0.0.0" else host
+    for _ in range(20):
+        time.sleep(0.2)
+        try:
+            with urllib.request.urlopen(f"http://{check_host}:{port}/api/health", timeout=1) as r:
+                data = json.loads(r.read())
+                print(f"started (pid {pid}) on http://{host}:{port}  works={data.get('works')}  covers={data.get('covers')}")
+                return
+        except Exception:
+            continue
+    print(f"started (pid {pid}) but health check failed; see {LOG_PATH}")
+    return
+
+
+def cmd_serve_foreground(args):
+    """Internal: run the server in this process (no fork).
+
+    Invoked by `start` via subprocess.Popen with start_new_session=True.
+    The detached child has its own session and survives the parent
+    shell exiting.
+    """
+    host = args.host
+    port = args.port
+    try:
+        build_cover_cache()
+    except Exception as e:
+        import traceback
+        print(f"build_cover_cache FAILED: {e}", flush=True)
+        traceback.print_exc()
+        sys.exit(1)
+    PID_PATH.write_text(str(os.getpid()))
+    try:
+        server = ThreadingHTTPServer((host, port), AsmrViewHandler)
+    except Exception as e:
+        import traceback
+        print(f"ThreadingHTTPServer FAILED: {e}", flush=True)
+        traceback.print_exc()
+        sys.exit(1)
+    print(f"asmr-view serving on http://{host}:{port}", flush=True)
+    try:
+        server.serve_forever()
+    except Exception as e:
+        import traceback
+        print(f"asmr-view serve_forever FAILED: {e}", flush=True)
+        traceback.print_exc()
+        raise
+    finally:
+        server.server_close()
+        PID_PATH.unlink(missing_ok=True)
+
+
+def cmd_stop(args):
+    if not PID_PATH.exists():
+        print("not running")
+        return
+    pid = int(PID_PATH.read_text().strip())
+    try:
+        os.kill(pid, signal.SIGTERM)
+        for _ in range(20):
+            time.sleep(0.1)
+            try:
+                os.kill(pid, 0)
+            except OSError:
+                print(f"stopped (pid {pid})")
+                return
+        os.kill(pid, signal.SIGKILL)
+        print(f"force-killed (pid {pid})")
+    except OSError as e:
+        print(f"stop failed: {e}")
+    finally:
+        PID_PATH.unlink(missing_ok=True)
+
+
+def cmd_status(args):
+    if not PID_PATH.exists():
+        print("not running")
+        return
+    pid = int(PID_PATH.read_text().strip())
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        print(f"stale pid {pid}; cleaning up")
+        PID_PATH.unlink(missing_ok=True)
+        return
+    port = args.port
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/health", timeout=2) as r:
+            data = json.loads(r.read())
+            print(f"running (pid {pid})  url=http://127.0.0.1:{port}  works={data.get('works')}  covers={data.get('covers')}")
+    except Exception as e:
+        print(f"pid {pid} alive but http not responding: {e}")
+
+
+def cmd_open(args):
+    print(f"http://127.0.0.1:{args.port}/")
+
+
+def cmd_logs(args):
+    if not LOG_PATH.exists():
+        print("(no log)")
+        return
+    if args.follow:
+        subprocess.run(["tail", "-f", str(LOG_PATH)])
+    else:
+        subprocess.run(["tail", "-n", str(args.lines), str(LOG_PATH)])
+
+
+def main():
+    p = argparse.ArgumentParser(prog="asmr-view", description="Neokikoeru-style local viewer")
+    p.add_argument("--port", type=int, default=8890)
+    # Default to 0.0.0.0 so the viewer is reachable on the current
+    # LAN IP (e.g. http://192.168.5.6:8890) without per-restart
+    # edits. Override with --host 127.0.0.1 for localhost-only.
+    p.add_argument("--host", default="0.0.0.0")
+    sp = p.add_subparsers(dest="cmd", required=True)
+
+    s = sp.add_parser("start", help="start the viewer in the background")
+    s.set_defaults(func=cmd_start)
+
+    # Internal subcommand used by `start` to launch a fully detached
+    # child via subprocess.Popen. Not intended for direct use.
+    s2 = sp.add_parser("_serve_foreground", help=argparse.SUPPRESS)
+    s2.set_defaults(func=cmd_serve_foreground)
+
+    s = sp.add_parser("stop", help="stop the viewer")
+    s.set_defaults(func=cmd_stop)
+
+    s = sp.add_parser("status", help="show running status")
+    s.set_defaults(func=cmd_status)
+
+    s = sp.add_parser("open", help="print the viewer URL")
+    s.set_defaults(func=cmd_open)
+
+    s = sp.add_parser("logs", help="tail viewer logs")
+    s.add_argument("-f", "--follow", action="store_true")
+    s.add_argument("-n", "--lines", type=int, default=50)
+    s.set_defaults(func=cmd_logs)
+
+    args = p.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
