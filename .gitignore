@@ -233,3 +233,23 @@ MEMORY.md.backup-*
 memory/
 memory-backup-*/
 hermes-asmr-copy/
+
+# Web-UI publish bundle local/runtime leftovers.
+Web-UI/-/
+Web-UI/.asmr-one-cookies.txt
+Web-UI/.asmroner-data/
+Web-UI/*.log
+Web-UI/*.pid
+Web-UI/bin/__pycache__/
+Web-UI/bin/asmroner
+Web-UI/bin/neokikoeru
+Web-UI/kikoeru-spa/**/*.map
+Web-UI/kikoeru-spa/headroom_memory.db
+Web-UI/kikoeru-spa/js/.tirith/
+Web-UI/lib/__pycache__/
+Web-UI/listen-index/
+Web-UI/listen-index-*.json
+Web-UI/listen-index-*.txt
+Web-UI/logs/
+Web-UI/neokikoeru.version
+Web-UI/serve-index/
