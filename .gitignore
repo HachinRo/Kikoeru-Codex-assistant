@@ -236,10 +236,12 @@ hermes-asmr-copy/
 
 # Web-UI publish bundle local/runtime leftovers.
 Web-UI/-/
+Web-UI/-
 Web-UI/.asmr-one-cookies.txt
 Web-UI/.asmroner-data/
 Web-UI/*.log
 Web-UI/*.pid
+Web-UI/serve-config.json
 Web-UI/bin/__pycache__/
 Web-UI/bin/asmroner
 Web-UI/bin/neokikoeru
