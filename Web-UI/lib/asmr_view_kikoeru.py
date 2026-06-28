@@ -56,6 +56,20 @@ TEXT_EXTS = {".txt", ".pdf", ".md", ".log"}
 SUB_EXTS = {".lrc", ".srt", ".vtt", ".ass", ".ssa"}
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
 VIDEO_EXTS = {".mp4", ".mkv", ".webm", ".mov"}
+_NATURAL_NUMBER_RE = re.compile(r"(\d+)")
+
+
+def natural_file_sort_key(row) -> tuple:
+    """Sort file rows by folder first, then human/numeric filename order."""
+    is_folder = False if isinstance(row, str) else bool(row["is_folder"])
+    name = row if isinstance(row, str) else row["name"]
+    parts = []
+    for part in _NATURAL_NUMBER_RE.split(name):
+        if part.isdigit():
+            parts.append((1, int(part), len(part)))
+        elif part:
+            parts.append((0, part.casefold()))
+    return (0 if is_folder else 1, tuple(parts), name.casefold())
 
 
 def rj_to_numeric(rj: str) -> int:
@@ -321,6 +335,7 @@ def build_tree(conn, work_id: str) -> list:
                ORDER BY is_folder DESC, name""",
             (parent_id,),
         ).fetchall()
+        rows = sorted(rows, key=natural_file_sort_key)
         for r in rows:
             node = _file_to_kikoeru(conn, r)
             if r["is_folder"]:
