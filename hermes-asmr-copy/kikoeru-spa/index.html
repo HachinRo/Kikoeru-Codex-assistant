@@ -1,0 +1,289 @@
+<!DOCTYPE html>
+<html>
+  <head><base href="/">
+    <title>Kikoeru</title>
+
+    <meta charset="utf-8">
+    <meta name="description" content="A self-hosted web media player for listening to your DLsite voice works.">
+    <meta name="format-detection" content="telephone=no">
+    <meta name="msapplication-tap-highlight" content="no">
+    <meta name="viewport" content="user-scalable=no, initial-scale=1, maximum-scale=1, minimum-scale=1, width=device-width">
+
+    <link rel="icon" type="image/png" href="statics/app-logo-128x128.png">
+    <link rel="icon" type="image/png" sizes="16x16" href="statics/icons/favicon-16x16.png">
+    <link rel="icon" type="image/png" sizes="32x32" href="statics/icons/favicon-32x32.png">
+    <link rel="icon" type="image/png" sizes="96x96" href="statics/icons/favicon-96x96.png">
+    <link rel="icon" type="image/ico" href="statics/icons/favicon.ico">
+  <link href="/css/app.88bd61a4.css" rel="stylesheet">
+  <style>
+    #asmr-index-refresh {
+      position: fixed;
+      right: 18px;
+      top: 58px;
+      z-index: 99999;
+      width: 40px;
+      height: 40px;
+      border: 0;
+      border-radius: 50%;
+      background: #1976d2;
+      color: #fff;
+      box-shadow: 0 2px 7px rgba(0,0,0,.35);
+      cursor: pointer;
+      font-size: 22px;
+      line-height: 40px;
+    }
+    #asmr-index-refresh[disabled] {
+      opacity: .65;
+      cursor: wait;
+    }
+    #asmr-library-dashboard-link {
+      position: fixed;
+      right: 18px;
+      top: 106px;
+      z-index: 99999;
+      width: 40px;
+      height: 40px;
+      border-radius: 50%;
+      background: #009688;
+      color: #fff;
+      box-shadow: 0 2px 7px rgba(0,0,0,.35);
+      cursor: pointer;
+      font-size: 20px;
+      line-height: 40px;
+      text-align: center;
+      text-decoration: none;
+    }
+    #asmr-work-delete {
+      position: fixed;
+      right: 18px;
+      top: 154px;
+      z-index: 99999;
+      width: 40px;
+      height: 40px;
+      border: 0;
+      border-radius: 50%;
+      background: #c10015;
+      color: #fff;
+      box-shadow: 0 2px 7px rgba(0,0,0,.35);
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    #asmr-work-delete[disabled] {
+      opacity: .65;
+      cursor: wait;
+    }
+    .asmr-delete-overlay {
+      position: fixed;
+      inset: 0;
+      z-index: 100000;
+      background: rgba(0,0,0,.45);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 18px;
+    }
+    .asmr-delete-dialog {
+      width: min(440px, 100%);
+      border-radius: 4px;
+      background: #fff;
+      color: rgba(0,0,0,.87);
+      box-shadow: 0 8px 24px rgba(0,0,0,.35);
+      padding: 22px;
+      font-family: Roboto, -apple-system, Helvetica Neue, Helvetica, Arial, sans-serif;
+    }
+    .asmr-delete-dialog h2 {
+      margin: 0 0 12px;
+      font-size: 21px;
+      font-weight: 500;
+    }
+    .asmr-delete-dialog p {
+      margin: 0 0 12px;
+      line-height: 1.45;
+    }
+    .asmr-delete-title {
+      font-weight: 500;
+    }
+    .asmr-delete-dialog input {
+      width: 100%;
+      box-sizing: border-box;
+      border: 1px solid #bdbdbd;
+      border-radius: 4px;
+      padding: 10px 12px;
+      font: inherit;
+    }
+    .asmr-delete-actions {
+      display: flex;
+      justify-content: flex-end;
+      gap: 10px;
+      margin-top: 18px;
+    }
+    .asmr-delete-actions button {
+      border: 0;
+      border-radius: 3px;
+      padding: 8px 14px;
+      font: inherit;
+      font-weight: 500;
+      cursor: pointer;
+    }
+    .asmr-delete-cancel {
+      background: transparent;
+      color: #1976d2;
+    }
+    .asmr-delete-confirm {
+      background: #c10015;
+      color: #fff;
+    }
+    .asmr-delete-confirm[disabled] {
+      opacity: .5;
+      cursor: not-allowed;
+    }
+    .asmr-work-cover-panel {
+      display: block;
+      width: min(280px, calc(100vw - 32px));
+      margin: 16px 16px 8px;
+      border-radius: 4px;
+      overflow: hidden;
+      background: rgba(0,0,0,.08);
+      box-shadow: 0 2px 8px rgba(0,0,0,.22);
+    }
+    .asmr-work-cover-panel img {
+      display: block;
+      width: 100%;
+      height: auto;
+    }
+  </style></head>
+  <body>
+    <noscript>
+      We are sorry, but Kikoeru requires Javascript to work.
+    </noscript>
+    <!-- DO NOT touch the following DIV -->
+    <div id="q-app"></div>
+    <button id="asmr-index-refresh" title="Refresh ASMR index and cover metadata">↻</button>
+    <a id="asmr-library-dashboard-link" title="ASMR library dashboard" href="/asmr-library">☷</a>
+    <script>
+      (function () {
+        var btn = document.getElementById('asmr-index-refresh')
+        if (!btn) return
+        function currentWorkRj () {
+          var m = window.location.pathname.match(/^\/work\/(RJ\d+)/i)
+          return m ? m[1].toUpperCase() : ''
+        }
+        function jsonFetch (path, opts) {
+          return fetch(path, opts).then(function (r) {
+            return r.json().then(function (j) {
+              if (!r.ok) throw new Error(j.error || r.statusText)
+              return j
+            })
+          })
+        }
+        function waitAction (id) {
+          return new Promise(function (resolve, reject) {
+            function poll () {
+              jsonFetch('/api/asmr-library/actions/' + encodeURIComponent(id))
+                .then(function (action) {
+                  if (action.status === 'running') return setTimeout(poll, 1200)
+                  if (action.status === 'done') return resolve(action)
+                  reject(new Error(action.error || action.output || 'Action failed'))
+                })
+                .catch(reject)
+            }
+            poll()
+          })
+        }
+        function runWorkRefresh (rj) {
+          return jsonFetch('/api/asmr-library/actions/fix-content', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({rj: rj})
+          }).then(function (action) {
+            return waitAction(action.id)
+          }).then(function () {
+            return jsonFetch('/api/admin/reindex', { method: 'POST' })
+          })
+        }
+        btn.addEventListener('click', function () {
+          var old = btn.textContent
+          var rj = currentWorkRj()
+          btn.disabled = true
+          btn.textContent = '…'
+          var work = rj ? runWorkRefresh(rj) : jsonFetch('/api/admin/reindex', { method: 'POST' })
+          work.then(function (res) {
+              btn.textContent = '✓'
+              console.log(rj ? 'ASMR work refresh result:' : 'ASMR index refresh result:', res)
+              setTimeout(function () {
+                btn.textContent = old
+                btn.disabled = false
+                if (rj) window.location.reload()
+              }, 900)
+            })
+            .catch(function (err) {
+              btn.textContent = '!'
+              console.error('ASMR refresh failed:', err)
+              setTimeout(function () { btn.textContent = old; btn.disabled = false }, 2200)
+            })
+        })
+      }())
+    </script>
+    <script type="text/javascript" src="/js/asmr-work-delete.js"></script>
+    <script>
+      (function () {
+        var current = ''
+        function workIdFromPath () {
+          var m = window.location.pathname.match(/^\/work\/(RJ\d+)/i)
+          return m ? m[1].toUpperCase() : ''
+        }
+        function removeCover () {
+          var old = document.getElementById('asmr-work-cover-panel')
+          if (old) old.remove()
+        }
+        function insertCover (id) {
+          var root = document.querySelector('.q-page')
+          if (!root || document.getElementById('asmr-work-cover-panel')) return
+          fetch('/api/work/' + encodeURIComponent(id))
+            .then(function (r) { return r.ok ? r.json() : null })
+            .then(function (work) {
+              if (!work || !work.has_cover) return
+              var panel = document.createElement('a')
+              panel.id = 'asmr-work-cover-panel'
+              panel.className = 'asmr-work-cover-panel'
+              panel.href = work.coverUrl || ('/api/covers/' + id)
+              panel.target = '_blank'
+              panel.rel = 'noopener'
+              var img = document.createElement('img')
+              img.alt = work.title || id
+              img.src = (work.coverUrl || ('/api/covers/' + id)) + '?v=' + Date.now()
+              panel.appendChild(img)
+              root.insertBefore(panel, root.firstChild)
+            })
+            .catch(function (err) { console.warn('ASMR work cover insert failed:', err) })
+        }
+        function syncCover () {
+          var id = workIdFromPath()
+          if (!id) {
+            current = ''
+            removeCover()
+            return
+          }
+          if (id === current && document.getElementById('asmr-work-cover-panel')) return
+          current = id
+          removeCover()
+          setTimeout(function () { insertCover(id) }, 250)
+          setTimeout(function () { insertCover(id) }, 1200)
+        }
+        ;['pushState', 'replaceState'].forEach(function (name) {
+          var original = history[name]
+          history[name] = function () {
+            var result = original.apply(this, arguments)
+            setTimeout(syncCover, 0)
+            return result
+          }
+        })
+        window.addEventListener('popstate', syncCover)
+        new MutationObserver(syncCover).observe(document.getElementById('q-app'), { childList: true, subtree: true })
+        syncCover()
+      }())
+    </script>
+  <script type="text/javascript" src="/js/app.051b603f.fix6.js"></script><script type="text/javascript" src="/js/runtime.3597b51d.js"></script><script type="text/javascript" src="/js/vendor.86022408.js"></script></body>
+</html>

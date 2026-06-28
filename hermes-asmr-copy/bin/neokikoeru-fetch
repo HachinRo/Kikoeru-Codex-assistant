@@ -1,0 +1,75 @@
+#!/bin/sh
+# Idempotent fetch of the latest Neokikoeru binary from vscodev/neokikoeru
+# releases. Writes the resolved semver to ~/.hermes/asmr/neokikoeru.version.
+#
+# Asset pattern (verified from expanded_assets on 2026-06-22):
+#   neokikoeru-macos-amd64.tar.gz
+#   neokikoeru-macos-arm64.tar.gz
+#   neokikoeru-linux-amd64.tar.gz
+#   neokikoeru-linux-arm64.tar.gz
+#   neokikoeru-windows-amd64.zip
+#   neokikoeru-windows-arm64.zip
+set -eu
+umask 077
+
+HERMES_ROOT="${HERMES_HOME:-${HOME}/.hermes}"
+STATE_ROOT="${HERMES_ASMR_HOME:-${HERMES_ROOT}/asmr}"
+BIN_DIR="${STATE_ROOT}/bin"
+VERSION_FILE="${STATE_ROOT}/neokikoeru.version"
+REPO="vscodev/neokikoeru"
+API="https://api.github.com/repos/${REPO}/releases/latest"
+
+case "$(uname -s):$(uname -m)" in
+    Darwin:arm64|Darwin:aarch64) os_part="macos"; arch_part="arm64" ;;
+    Darwin:x86_64|Darwin:amd64)   os_part="macos"; arch_part="amd64" ;;
+    Linux:arm64|Linux:aarch64)    os_part="linux"; arch_part="arm64" ;;
+    Linux:x86_64|Linux:amd64)     os_part="linux"; arch_part="amd64" ;;
+    *) echo "Unsupported platform: $(uname -s)/$(uname -m)" >&2 ; exit 1 ;;
+esac
+
+asset="neokikoeru-${os_part}-${arch_part}.tar.gz"
+target="${BIN_DIR}/neokikoeru"
+mkdir -p "${BIN_DIR}"
+
+tmp_meta="$(mktemp -t neokikoeru-meta.XXXXXX)"
+trap 'rm -f -- "${tmp_meta}"' EXIT
+http_code="$(curl -sS -o "${tmp_meta}" -w '%{http_code}' -H 'Accept: application/vnd.github+json' "${API}" || echo 000)"
+
+# If the API is unreachable (rate-limited, offline, etc.) but we already have
+# a working binary of a known version, treat that as success. The user can
+# re-run later to refresh.
+if [ "${http_code}" != "200" ]; then
+    if [ -x "${target}" ] && [ -n "$(cat "${VERSION_FILE}" 2>/dev/null || true)" ]; then
+        echo "Neokikoeru $(cat "${VERSION_FILE}" 2>/dev/null) already installed at ${target}; cannot reach GitHub API (HTTP ${http_code}) to check for updates"
+        exit 0
+    fi
+    echo "Could not reach GitHub API (HTTP ${http_code}) and no installed binary to fall back on" >&2
+    exit 1
+fi
+
+# tag_name: "v3.7.1" — line-based grep, no jq dependency.
+tag="$(awk -F'"' '/"tag_name":/ {print $4; exit}' "${tmp_meta}")"
+[ -n "${tag}" ] || { echo "Could not parse latest release tag from GitHub API" >&2; exit 1; }
+
+if [ -x "${target}" ] && [ "$(cat "${VERSION_FILE}" 2>/dev/null || true)" = "${tag}" ]; then
+    echo "Neokikoeru ${tag} already installed at ${target}"
+    exit 0
+fi
+
+download_url="https://github.com/${REPO}/releases/download/${tag}/${asset}"
+tmp_tar="$(mktemp -t neokikoeru-tar.XXXXXX)"
+trap 'rm -f -- "${tmp_meta}" "${tmp_tar}"' EXIT
+echo "Downloading ${download_url}"
+curl -fsSL "${download_url}" -o "${tmp_tar}"
+
+tmp_dir="$(mktemp -d -t neokikoeru-extract.XXXXXX)"
+tar -xzf "${tmp_tar}" -C "${tmp_dir}"
+
+# The release tarball contains a single executable named "neokikoeru".
+[ -f "${tmp_dir}/neokikoeru" ] || { echo "Release archive did not contain neokikoeru binary" >&2; exit 1; }
+install -m 0755 "${tmp_dir}/neokikoeru" "${target}"
+
+printf '%s\n' "${tag}" > "${VERSION_FILE}"
+rm -rf -- "${tmp_dir}" "${tmp_tar}" "${tmp_meta}"
+trap - EXIT
+echo "Installed Neokikoeru ${tag} -> ${target}"

@@ -1,0 +1,331 @@
+#!/usr/bin/env python3
+"""
+ASMR Library - Neokikoeru companion CLI.
+
+Commands:
+  files <RJ>            List files in a work (DB-backed, no license needed)
+  fcat <file_id>        Stream a file to stdout
+  fget <file_id> [out]  Download a file
+  works [page]          List works via API
+  work <RJ>             Get work metadata via API
+
+The Neokikoeru v3.7.1 WebUI hides the file list behind a paid license, so we
+read files directly from the SQLite database and fetch binaries via the
+unencrypted /fs/download endpoint.
+"""
+import argparse
+import json
+import os
+import sqlite3
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+from typing import Optional
+
+# --- config -----------------------------------------------------------------
+
+STATE_ROOT = Path(os.environ.get("HERMES_ASMR_HOME", f"{os.environ['HOME']}/.hermes/asmr"))
+CONFIG_FILE = STATE_ROOT / "serve-config.json"
+NEOKI_DATA = Path(os.environ.get("HERMES_NEOKI_DATA", f"{os.environ['HOME']}/Library/Application Support/neokikoeru"))
+DB_PATH = NEOKI_DATA / "neokikoeru.db"
+
+# --- helpers ----------------------------------------------------------------
+
+def fail(msg: str, code: int = 1):
+    print(f"FAILED: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def load_config() -> dict:
+    if not CONFIG_FILE.exists():
+        fail(f"Missing config: {CONFIG_FILE}. Run: asmr-library serve login")
+    try:
+        return json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+    except Exception as e:
+        fail(f"Invalid config {CONFIG_FILE}: {e}")
+
+
+def api_get(path: str, cfg: dict) -> dict:
+    token = cfg.get("token", "")
+    port = cfg.get("port", "8889")
+    url = f"http://localhost:{port}/api/v1{path}"
+    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return json.load(r)
+    except urllib.error.URLError as e:
+        fail(f"API request failed: {url}: {e}")
+
+
+def viewer_get(path: str) -> dict:
+    """GET JSON from the always-on asmr-view compatibility API."""
+    base = os.environ.get("ASMR_VIEW_URL", "http://127.0.0.1:8890")
+    url = base.rstrip("/") + path
+    req = urllib.request.Request(url)
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return json.load(r)
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", "replace")
+        fail(f"Viewer API request failed: {url}: HTTP {e.code}: {body}")
+    except urllib.error.URLError as e:
+        fail(f"Viewer API request failed: {url}: {e}")
+
+
+def human_size(n: int) -> str:
+    if n is None:
+        return "-"
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or unit == "TB":
+            return f"{n:.1f}{unit}" if unit != "B" else f"{n}B"
+        n /= 1024
+    return f"{n:.1f}TB"
+
+
+def open_db() -> sqlite3.Connection:
+    if not DB_PATH.exists():
+        fail(f"Neokikoeru DB not found at {DB_PATH}. Run: asmr-library serve start")
+    db = sqlite3.connect(str(DB_PATH))
+    db.row_factory = sqlite3.Row
+    return db
+
+
+# --- commands ---------------------------------------------------------------
+
+def cmd_files(rj: str, json_out: bool = False, only_audio: bool = False):
+    rj = rj.upper()
+    if not rj.startswith("RJ"):
+        fail(f"Bad RJ code: {rj}")
+    db = open_db()
+    # Check work exists
+    work = db.execute(
+        "SELECT id, name, maker_id FROM works WHERE id=?",
+        (rj,),
+    ).fetchone()
+    if not work:
+        fail(f"Work {rj} not found in DB. Run: asmr-library serve storage scan 1")
+
+    # Build the folder/file tree
+    rows = db.execute(
+        """
+        SELECT f.id, f.name, f.path, f.size, f.duration, f.is_folder, f.parent_id, f.work_id
+        FROM files f
+        WHERE f.work_id=?
+        ORDER BY f.is_folder DESC, f.name
+        """,
+        (rj,),
+    ).fetchall()
+
+    # Filter to only audio (skip folders and non-audio extensions)
+    audio_exts = {".mp3", ".wav", ".flac", ".m4a", ".aac", ".ogg", ".opus"}
+    sub_exts = {".srt", ".vtt", ".ass", ".ssa", ".lrc"}
+    image_exts = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp"}
+
+    def classify(name: str) -> str:
+        ext = Path(name).suffix.lower()
+        if ext in audio_exts:
+            return "audio"
+        if ext in sub_exts:
+            return "subs"
+        if ext in image_exts:
+            return "image"
+        return "other"
+
+    if only_audio:
+        rows = [r for r in rows if not r["is_folder"] and classify(r["name"]) == "audio"]
+
+    if json_out:
+        items = []
+        for r in rows:
+            items.append({
+                "id": r["id"],
+                "name": r["name"],
+                "path": r["path"],
+                "size": r["size"],
+                "size_human": human_size(r["size"]) if r["size"] else "-",
+                "duration": r["duration"],
+                "is_folder": bool(r["is_folder"]),
+                "kind": "folder" if r["is_folder"] else classify(r["name"]),
+            })
+        print(json.dumps({"work": rj, "name": work["name"], "items": items}, indent=2, ensure_ascii=False))
+        return
+
+    # Pretty tree
+    folders = [r for r in rows if r["is_folder"]]
+    files = [r for r in rows if not r["is_folder"]]
+
+    print(f"Work:  {rj}  ({work['name'] or '—'})")
+    print(f"Files: {len(files)}  |  Folders: {len(folders)}")
+    total_size = sum(r["size"] or 0 for r in files)
+    print(f"Total: {human_size(total_size)}")
+    print()
+    if folders:
+        print("Folders:")
+        for r in folders:
+            print(f"  📁 {r['name']}")
+        print()
+
+    if not files:
+        return
+
+    print(f"{'ID':<22}  {'KIND':<6}  {'SIZE':>10}  {'NAME'}")
+    print(f"{'-'*22}  {'-'*6}  {'-'*10}  {'-'*40}")
+    for r in files:
+        kind = classify(r["name"])
+        kind_icon = {"audio": "🎵", "subs": "💬", "image": "🖼", "other": "📄"}.get(kind, "📄")
+        print(f"{r['id']:<22}  {kind_icon + kind:<6}  {human_size(r['size'] or 0):>10}  {r['name']}")
+
+
+def cmd_fcat(file_id: str):
+    base = os.environ.get("ASMR_VIEW_URL", "http://127.0.0.1:8890").rstrip("/")
+    url = f"{base}/api/media/stream/{urllib.parse.quote(file_id)}"
+    req = urllib.request.Request(url)
+    try:
+        with urllib.request.urlopen(req, timeout=300) as r:
+            while True:
+                chunk = r.read(65536)
+                if not chunk:
+                    break
+                sys.stdout.buffer.write(chunk)
+    except urllib.error.HTTPError as e:
+        fail(f"Download failed: HTTP {e.code}: {e.read().decode('utf-8', 'replace')}")
+    except urllib.error.URLError as e:
+        fail(f"Download failed: {e}")
+
+def cmd_fget(file_id: str, out_path: Optional[str]):
+    base = os.environ.get("ASMR_VIEW_URL", "http://127.0.0.1:8890").rstrip("/")
+    url = f"{base}/api/media/download/{urllib.parse.quote(file_id)}"
+    req = urllib.request.Request(url)
+    try:
+        with urllib.request.urlopen(req, timeout=300) as r:
+            cd = r.headers.get("Content-Disposition", "")
+            if "filename=" in cd:
+                fname = cd.split("filename=", 1)[1].strip('"')
+            else:
+                db = open_db()
+                row = db.execute("SELECT name FROM files WHERE id=?", (file_id,)).fetchone()
+                fname = row["name"] if row else file_id
+            target = Path(out_path) if out_path else Path.cwd() / fname
+            with open(target, "wb") as f:
+                while True:
+                    chunk = r.read(65536)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+    except urllib.error.HTTPError as e:
+        fail(f"Download failed: HTTP {e.code}: {e.read().decode('utf-8', 'replace')}")
+    except urllib.error.URLError as e:
+        fail(f"Download failed: {e}")
+    print(f"Downloaded {human_size(target.stat().st_size)} {target}")
+
+def cmd_works(page: int = 1, page_size: int = 30, search: Optional[str] = None):
+    params = [f"page={page}", f"size={page_size}"]
+    if search:
+        params.append(f"search={urllib.parse.quote(search)}")
+    data = viewer_get(f"/api/works?{'&'.join(params)}")
+    items = data.get("works", data.get("data", []))
+    total = data.get("total", data.get("count", "?"))
+    print(f"Page {page}  (showing {len(items)} of {total} works)")
+    if not items:
+        return
+    for w in items:
+        title = w.get("title") or w.get("name") or "—"
+        maker_obj = w.get("circle") or w.get("maker") or {}
+        maker = maker_obj.get("name", "—") if isinstance(maker_obj, dict) else str(maker_obj or "—")
+        rating = w.get("rating", None)
+        if rating is None:
+            try:
+                rating = float(w.get("rate_average_2dp") or 0)
+            except (TypeError, ValueError):
+                rating = 0
+        rating_count = w.get("rating_count", w.get("rate_count", 0)) or 0
+        age = w.get("age_category", "")
+        print(f"  {w['id']}  ★{rating:.1f} ({rating_count})  R{age}  {title}  — {maker}")
+
+
+def cmd_work(rj: str, json_out: bool = False):
+    rj = rj.upper()
+    if not rj.startswith("RJ"):
+        fail(f"Bad RJ code: {rj}")
+    data = viewer_get(f"/api/work/{rj}")
+    if json_out:
+        print(json.dumps(data, indent=2, ensure_ascii=False))
+        return
+    print(f"ID:     {data.get('id')}")
+    print(f"Title: {data.get('title') or data.get('name') or '—'}")
+    maker_obj = data.get("circle") or data.get("maker") or {}
+    maker = maker_obj.get("name", "—") if isinstance(maker_obj, dict) else str(maker_obj or "—")
+    print(f"Maker: {maker}")
+    series = data.get("series") or {}
+    print(f"Series: {series.get('name', '—') if isinstance(series, dict) else '—'}")
+    rating = data.get("rating", None)
+    if rating is None:
+        try:
+            rating = float(data.get("rate_average_2dp") or 0)
+        except (TypeError, ValueError):
+            rating = 0
+    print(f"Rating: {rating:.1f} ({data.get('rating_count', data.get('rate_count', 0))} ratings)")
+    print(f"Price:  {data.get('price', 0)} JPY")
+    print(f"Age:    R{data.get('age_category', '?')}")
+    intro = data.get("intro", "")
+    if intro:
+        print(f"\nIntro:  {intro[:300]}{'...' if len(intro) > 300 else ''}")
+    raw_genres = data.get("genres") if data.get("genres") is not None else data.get("tags", [])
+    genres = [g.get("name", "") if isinstance(g, dict) else str(g) for g in (raw_genres or [])]
+    if genres:
+        print(f"\nGenres: {', '.join(genres)}")
+    print()
+    # Also list files from the local DB
+    print("Files (from local DB):")
+    cmd_files(rj, json_out=False, only_audio=False)
+
+
+# --- main -------------------------------------------------------------------
+
+def main():
+    if len(sys.argv) < 2:
+        print(__doc__)
+        sys.exit(0)
+
+    cmd = sys.argv[1]
+    args = sys.argv[2:]
+
+    if cmd in ("-h", "--help", "help"):
+        print(__doc__)
+        return
+    if cmd == "files":
+        if not args:
+            fail("Usage: asmr-library files <RJ> [--audio] [--json]")
+        rj = args[0]
+        json_out = "--json" in args
+        only_audio = "--audio" in args
+        cmd_files(rj, json_out=json_out, only_audio=only_audio)
+    elif cmd == "fcat":
+        if not args:
+            fail("Usage: asmr-library fcat <file_id>")
+        cmd_fcat(args[0])
+    elif cmd == "fget":
+        if not args:
+            fail("Usage: asmr-library fget <file_id> [out_path]")
+        cmd_fget(args[0], args[1] if len(args) > 1 else None)
+    elif cmd == "works":
+        page = int(args[0]) if args and args[0].isdigit() else 1
+        search = None
+        for i, a in enumerate(args):
+            if a == "--search" and i + 1 < len(args):
+                search = args[i + 1]
+        cmd_works(page=page, search=search)
+    elif cmd == "work":
+        if not args:
+            fail("Usage: asmr-library work <RJ> [--json]")
+        rj = args[0]
+        json_out = "--json" in args
+        cmd_work(rj, json_out=json_out)
+    else:
+        fail(f"Unknown asmr-neo command '{cmd}'. Run: asmr-library --help")
+
+
+if __name__ == "__main__":
+    main()
