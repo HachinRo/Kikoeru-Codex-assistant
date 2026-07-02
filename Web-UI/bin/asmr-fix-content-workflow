@@ -9,7 +9,7 @@ case "$RJ" in
   *) echo "Bad RJ code: $RJ" >&2; exit 2 ;;
 esac
 
-LIBRARY_ROOT="${ASMR_LIBRARY_ROOT:-${HOME}/ASMR}"
+LIBRARY_ROOT="${ASMR_LIBRARY_ROOT:-${ASMR_MEDIA_ROOT:-/Volumes/TOSHIBA/AMSR}}"
 DB="${NEOKIKOERU_DB:-${HOME}/Library/Application Support/neokikoeru/neokikoeru.db}"
 WORK_DIR="${LIBRARY_ROOT}/${RJ}"
 

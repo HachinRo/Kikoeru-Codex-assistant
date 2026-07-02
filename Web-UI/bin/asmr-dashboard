@@ -21,14 +21,19 @@ from pathlib import Path
 from uuid import uuid4
 
 HOME = Path.home()
-STATE_ROOT = Path(os.environ.get("HERMES_ASMR_HOME", str(HOME / ".hermes" / "asmr")))
+DEFAULT_STATE_ROOT = Path(__file__).resolve().parent.parent
+STATE_ROOT = Path(os.environ.get("ASMR_STATE_ROOT") or os.environ.get("ASMR_STACK_ROOT") or DEFAULT_STATE_ROOT)
 ASMR_LIBRARY = STATE_ROOT / "bin" / "asmr-library"
 ASMR_VIEW = STATE_ROOT / "bin" / "asmr-view"
 NEOKIKOERU_SERVE = STATE_ROOT / "bin" / "neokikoeru-serve"
-LIBRARY_ROOT = Path(os.environ.get("ASMR_LIBRARY_ROOT", str(Path.home() / "ASMR")))
+DEFAULT_MEDIA_ROOT = Path("/Volumes/TOSHIBA/AMSR")
+LIBRARY_ROOT = Path(os.environ.get("ASMR_LIBRARY_ROOT") or os.environ.get("ASMR_MEDIA_ROOT") or DEFAULT_MEDIA_ROOT)
+VOLUME_ROOT = Path(os.environ.get("ASMR_VOLUME_ROOT") or LIBRARY_ROOT.parent)
+STAGING_ROOT = Path(os.environ.get("ASMR_STAGING_ROOT") or (VOLUME_ROOT / "AMSR.incoming"))
 NEOKIKOERU_DB = HOME / "Library" / "Application Support" / "neokikoeru" / "neokikoeru.db"
 NEOKIKOERU_COVERS = HOME / "Library" / "Application Support" / "neokikoeru" / "covers" / "doujin"
 ASMRONER_DB = STATE_ROOT / ".asmroner-data" / "asmroner.db"
+SUBTITLE_AVAILABILITY_CACHE = STATE_ROOT / ".asmr-subtitle-availability.json"
 SUB_EXTS = {".lrc", ".vtt", ".srt", ".ass", ".ssa"}
 AUDIO_EXTS = {".mp3", ".wav", ".flac", ".m4a", ".aac", ".ogg", ".opus"}
 ASMR_TRACK_API_BASES = ("https://api.asmr.one", "https://api.asmr-200.com", "https://api.asmr-300.com")
@@ -79,6 +84,11 @@ def run_capture(argv: list[str], timeout: int = 120) -> dict:
             cwd=str(STATE_ROOT),
             env={
                 **os.environ,
+                "ASMR_LIBRARY_ROOT": str(LIBRARY_ROOT),
+                "ASMR_MEDIA_ROOT": str(LIBRARY_ROOT),
+                "ASMR_VOLUME_ROOT": str(VOLUME_ROOT),
+                "ASMR_STAGING_ROOT": str(STAGING_ROOT),
+                "ASMR_STORAGE_ROOT": str(LIBRARY_ROOT),
                 "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
             },
         )
@@ -378,6 +388,27 @@ def action_list() -> list[dict]:
         return [dict(record) for record in reversed(items)]
 
 
+def subtitle_available_cache(missing_subs: list[str]) -> tuple[list[dict], int | None]:
+    if not SUBTITLE_AVAILABILITY_CACHE.exists():
+        return [], None
+    try:
+        data = json.loads(SUBTITLE_AVAILABILITY_CACHE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return [], None
+
+    missing = {rj.upper() for rj in missing_subs}
+    seen = set()
+    items = []
+    for item in data.get("available") or []:
+        rj = str(item.get("rj") or "").upper()
+        if not rj or rj not in missing or rj in seen:
+            continue
+        seen.add(rj)
+        items.append(item)
+    checked_at = data.get("checked_at")
+    return items, checked_at if isinstance(checked_at, int) else None
+
+
 def library_summary() -> dict:
     library_dirs = []
     missing_subs = []
@@ -425,6 +456,8 @@ def library_summary() -> dict:
         except OSError:
             failed_sync = -1
 
+    subtitle_available, subtitle_available_checked_at = subtitle_available_cache(missing_subs)
+
     return {
         "library_root": str(LIBRARY_ROOT),
         "library_mounted": LIBRARY_ROOT.is_dir(),
@@ -434,6 +467,9 @@ def library_summary() -> dict:
         "covers": covers,
         "audio_files": total_audio,
         "subtitle_files": total_subs,
+        "subtitle_available_count": len(subtitle_available),
+        "subtitle_available": subtitle_available,
+        "subtitle_available_checked_at": subtitle_available_checked_at,
         "missing_subtitle_count": len(missing_subs),
         "missing_subtitles": missing_subs,
         "asmroner_failed_records": failed_sync,
@@ -580,8 +616,9 @@ a { color:var(--accent); }
  <div class="action-strip">
   <button class="primary" onclick="action('download')">Download</button>
   <button onclick="action('retry')">Retry</button>
-  <button onclick="action('fill')">Fill</button>
+  <button title="Download and merge a repair payload without overwriting existing files" onclick="action('fill')">Fill</button>
   <button onclick="action('subs-fetch')">Fetch subs</button>
+  <button onclick="action('subs-search')">Search subs</button>
  </div>
  <div id="work"></div>
 </div>
@@ -591,7 +628,7 @@ a { color:var(--accent); }
 </main>
 <script>
 let active = new Set();
-const protectedActions = new Set(['download', 'fill']);
+const protectedActions = new Set(['download', 'retry', 'fill']);
 const adminAuthKey = 'asmrAdminBasicAuth';
 async function api(path, opts={}) {
  const r = await fetch(path, opts);
@@ -659,7 +696,7 @@ async function refresh(){
   const s = h.summary;
   document.getElementById('summary').innerHTML = `<div class="grid">`+
     stat('Library works', s.library_works) + stat('DB works', s.db_works ?? '-') +
-    stat('Covers', s.covers) + stat('Missing subs', s.missing_subtitle_count, s.missing_subtitle_count ? 'bad' : 'ok') +
+    stat('Subtitle available', s.subtitle_available_count ?? 0, s.subtitle_available_count ? 'bad' : 'ok') + stat('Missing subs', s.missing_subtitle_count, s.missing_subtitle_count ? 'bad' : 'ok') +
     stat('Audio files', s.audio_files) + stat('Subtitle files', s.subtitle_files) + `</div>`+
     `<p class="label">${esc(s.library_root)}</p>`;
   document.getElementById('missing').innerHTML = s.missing_subtitles.length
@@ -676,7 +713,7 @@ async function lookup(){
     `<pre>${esc(w.db_files.slice(0,80).map(f => (f.is_folder?'[dir] ':'      ')+f.path).join('\n'))}</pre>`;
 }
 async function action(name){
-  const needsRj = !['reindex','fix-covers'].includes(name);
+  const needsRj = !['reindex','fix-covers','subs-search'].includes(name);
   const body = needsRj ? {rj: document.getElementById('rj').value.trim()} : (name === 'fix-covers' ? {rj: document.getElementById('rj').value.trim()} : {});
  const headers = {'Content-Type':'application/json'};
  if(protectedActions.has(name) && !getAdminAuth()){
@@ -815,6 +852,8 @@ class Handler(BaseHTTPRequestHandler):
                 rec = queue_action("fix-covers", [str(STATE_ROOT / "bin" / "asmr-fix-covers-workflow"), sample_rj], timeout=1800)
             elif name == "reindex":
                 rec = queue_action("reindex", [str(ASMR_LIBRARY), "reindex"], timeout=1800)
+            elif name == "subs-search":
+                rec = queue_action("subs-search", [str(ASMR_LIBRARY), "subs", "search-missing"], timeout=3600)
             else:
                 rj = rj_arg(body.get("rj", ""))
                 mapping = {

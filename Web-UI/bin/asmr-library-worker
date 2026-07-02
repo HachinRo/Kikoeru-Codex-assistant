@@ -1,24 +1,26 @@
 #!/bin/sh
 #
-# Hermes ASMR library worker.
+# ASMR library worker.
 #
-# Do not call ASMRoner directly from Hermes. This wrapper provides stable RJ
+# Do not call ASMRoner directly from ad hoc scripts. This wrapper provides stable RJ
 # folders, locking, staging, verification, and atomic publication.
 #
 
 set -eu
 umask 077
 
-VOLUME_ROOT="${ASMR_VOLUME_ROOT:-${HOME}/ASMR}"
-LIBRARY_ROOT="${ASMR_LIBRARY_ROOT:-${VOLUME_ROOT}/AMSR}"
+VOLUME_ROOT="${ASMR_VOLUME_ROOT:-/Volumes/TOSHIBA}"
+LIBRARY_ROOT="${ASMR_LIBRARY_ROOT:-${ASMR_MEDIA_ROOT:-${VOLUME_ROOT}/AMSR}}"
 STAGING_ROOT="${ASMR_STAGING_ROOT:-${VOLUME_ROOT}/AMSR.incoming}"
-HERMES_ROOT="${HERMES_HOME:-${HOME}/.hermes}"
-STATE_ROOT="${HERMES_ASMR_HOME:-${HERMES_ROOT}/asmr}"
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)"
+DEFAULT_STATE_ROOT="$(CDPATH= cd -- "${SCRIPT_DIR}/.." && pwd -P)"
+STATE_ROOT="${ASMR_STATE_ROOT:-${ASMR_STACK_ROOT:-${DEFAULT_STATE_ROOT}}}"
 DOWNLOADER_BIN="${ASMRONER_BIN:-${STATE_ROOT}/bin/asmroner}"
 CONFIG_FILE="${STATE_ROOT}/.asmroner-data/config.toml"
 LOG_ROOT="${STATE_ROOT}/logs"
 LOCK_ROOT="${STATE_ROOT}/locks"
 TEST_MODE="${ASMR_TEST_MODE:-0}"
+NEOKIKOERU_DB="${NEOKIKOERU_DB:-${HOME}/Library/Application Support/neokikoeru/neokikoeru.db}"
 
 LOCK_PATH=""
 LOCK_HELD=0
@@ -39,12 +41,13 @@ fail() {
 usage() {
     cat <<'WORKER_USAGE'
 Usage:
-  asmr-library-worker download RJ01234567
-  asmr-library-worker status RJ01234567
-  asmr-library-worker retry RJ01234567
+ asmr-library-worker download RJ01234567
+ asmr-library-worker status RJ01234567
+ asmr-library-worker retry RJ01234567
+ asmr-library-worker fill RJ01234567
 
 Completed works are never overwritten. A failed download remains in
-${ASMR_STAGING_ROOT:-${HOME}/ASMR/AMSR.incoming} and must be retried explicitly.
+${ASMR_STAGING_ROOT:-/Volumes/TOSHIBA/AMSR.incoming} and must be retried explicitly.
 WORKER_USAGE
 }
 
@@ -179,6 +182,81 @@ validate_payload() {
     fi
 }
 
+completion_check() {
+    rj="$1"
+    final_path="$2"
+
+    python3 - "${rj}" "${final_path}" "${NEOKIKOERU_DB}" <<'PY'
+import os
+import sqlite3
+import sys
+
+rj, final_path, db_path = sys.argv[1:4]
+audio_exts = {".mp3", ".wav", ".flac", ".m4a", ".aac", ".ogg", ".opus"}
+
+
+def finish(code, message):
+    print(message)
+    raise SystemExit(code)
+
+
+if not os.path.isdir(final_path):
+    finish(1, f"incomplete reason=final_missing path={final_path}")
+
+if not db_path or not os.path.exists(db_path):
+    finish(2, f"unknown reason=db_missing path={db_path}")
+
+conn = None
+try:
+    conn = sqlite3.connect(db_path)
+    rows = conn.execute(
+        "SELECT path, size FROM files WHERE work_id = ? AND is_folder = 0 ORDER BY path",
+        (rj,),
+    ).fetchall()
+except sqlite3.Error as exc:
+    finish(2, f"unknown reason=db_error detail={exc}")
+finally:
+    if conn is not None:
+        conn.close()
+
+if not rows:
+    finish(2, f"unknown reason=no_db_files rj={rj}")
+
+missing = []
+zero_audio = []
+for db_file_path, expected_size in rows:
+    clean = (db_file_path or "").lstrip("/")
+    prefix = rj.upper() + "/"
+    if clean.upper().startswith(prefix):
+        clean = clean[len(rj) + 1 :]
+    if not clean:
+        continue
+
+    candidate = os.path.join(final_path, clean)
+    if not os.path.isfile(candidate):
+        missing.append(clean)
+        continue
+
+    suffix = os.path.splitext(candidate)[1].lower()
+    if suffix in audio_exts and os.path.getsize(candidate) == 0 and (expected_size or 0) > 0:
+        zero_audio.append(clean)
+
+if missing or zero_audio:
+    sample = (missing + zero_audio)[:5]
+    finish(
+        1,
+        "incomplete expected={} missing={} zero_audio={} sample={}".format(
+            len(rows),
+            len(missing),
+            len(zero_audio),
+            "; ".join(sample),
+        ),
+    )
+
+finish(0, f"complete expected={len(rows)}")
+PY
+}
+
 status_one() {
     rj="$1"
     final_path="${LIBRARY_ROOT}/${rj}"
@@ -233,10 +311,11 @@ run_fill() {
     # For a brand-new download where nothing is on disk, use
     # `download` instead. For a partially-staged work (data
     # under AMSR.incoming/<RJ>.partial), use `retry`.
-    rj="$1"
-    final_path="${LIBRARY_ROOT}/${rj}"
-    log_path="${LOG_ROOT}/${rj}.log"
-    lock_path="${LOCK_ROOT}/${rj}.lock"
+	rj="$1"
+	final_path="${LIBRARY_ROOT}/${rj}"
+	log_path="${LOG_ROOT}/${rj}.log"
+	lock_path="${LOCK_ROOT}/${rj}.lock"
+	marker_path="${final_path}/.asmr-download.json"
 
     require_volume
     [ -x "${DOWNLOADER_BIN}" ] || fail "Downloader is missing or not executable: ${DOWNLOADER_BIN}"
@@ -254,6 +333,29 @@ run_fill() {
         say "GONE ${rj}: target disappeared during lock acquisition."
         return 1
     fi
+
+    set +e
+    completion_message="$(completion_check "${rj}" "${final_path}")"
+    completion_status=$?
+    set -e
+	case "${completion_status}" in
+	0)
+		if [ -f "${marker_path}" ]; then
+			say "FILL_NOOP ${rj}: wrapper-verified folder already complete; ${completion_message}."
+			return 0
+		fi
+		say "FILL_FORCED ${rj}: local index says ${completion_message}, but no wrapper marker exists; downloading repair payload anyway."
+		;;
+1)
+	say "FILL_NEEDED ${rj}: ${completion_message}; downloading repair payload."
+            ;;
+        2)
+            warn "${rj} completeness could not be confirmed before fill; ${completion_message}; continuing with fill."
+            ;;
+        *)
+            fail "${rj} completeness check failed unexpectedly; ${completion_message}"
+            ;;
+    esac
 
     # Use a per-RJ temp under the staging root so concurrent fills
     # for different RJs don't collide. The .fill suffix keeps it
@@ -325,15 +427,29 @@ EOF
     rm -rf -- "${fill_stage}"
 
     completed_at="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
-    {
-        printf 'fill_completed=%s\n' "${completed_at}"
-        printf 'fill_added=%d\n' "${added}"
-        printf 'fill_kept=%d\n' "${kept}"
-        printf 'fill_conflicts=%d\n' "${conflicts}"
-        printf 'fill_bytes_added=%d\n' "${bytes_added}"
-    } >>"${log_path}"
+	{
+		printf 'fill_completed=%s\n' "${completed_at}"
+		printf 'fill_added=%d\n' "${added}"
+		printf 'fill_kept=%d\n' "${kept}"
+		printf 'fill_conflicts=%d\n' "${conflicts}"
+		printf 'fill_bytes_added=%d\n' "${bytes_added}"
+	} >>"${log_path}"
 
-    if [ "${added}" -eq 0 ] && [ "${conflicts}" -eq 0 ]; then
+	if [ "${conflicts}" -eq 0 ]; then
+		cat >"${marker_path}" <<METADATA_EOF
+{
+  "rj": "${rj}",
+  "completed_at": "${completed_at}",
+  "downloader": "ASMRoner v2.0.6",
+  "workflow": "asmr-library-fill",
+  "fill_added": ${added},
+  "fill_kept": ${kept},
+  "fill_bytes_added": ${bytes_added}
+}
+METADATA_EOF
+	fi
+
+	if [ "${added}" -eq 0 ] && [ "${conflicts}" -eq 0 ]; then
         say "FILL_NOOP ${rj}: no missing files; ${kept} already on disk."
     else
         say "FILLED ${rj}: added=${added} kept=${kept} conflicts=${conflicts} bytes_added=${bytes_added}; log ${log_path}"
@@ -407,12 +523,12 @@ run_download() {
     validate_payload "${payload}"
 
     completed_at="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
-    cat >"${payload}/.hermes-download.json" <<METADATA_EOF
+    cat >"${payload}/.asmr-download.json" <<METADATA_EOF
 {
   "rj": "${rj}",
   "completed_at": "${completed_at}",
   "downloader": "ASMRoner v2.0.6",
-  "workflow": "hermes-asmr-library"
+  "workflow": "asmr-library"
 }
 METADATA_EOF
 

@@ -26,9 +26,14 @@ from typing import Optional
 
 # --- config -----------------------------------------------------------------
 
-STATE_ROOT = Path(os.environ.get("HERMES_ASMR_HOME", f"{os.environ['HOME']}/.hermes/asmr"))
+DEFAULT_STATE_ROOT = Path(__file__).resolve().parent.parent
+STATE_ROOT = Path(os.environ.get("ASMR_STATE_ROOT") or os.environ.get("ASMR_STACK_ROOT") or DEFAULT_STATE_ROOT)
 CONFIG_FILE = STATE_ROOT / "serve-config.json"
-NEOKI_DATA = Path(os.environ.get("HERMES_NEOKI_DATA", f"{os.environ['HOME']}/Library/Application Support/neokikoeru"))
+NEOKI_DATA = Path(
+    os.environ.get("NEOKIKOERU_DATA_ROOT")
+    or os.environ.get("NEOKIKOERU_DATA")
+    or str(Path.home() / "Library" / "Application Support" / "neokikoeru")
+)
 DB_PATH = NEOKI_DATA / "neokikoeru.db"
 
 # --- helpers ----------------------------------------------------------------
