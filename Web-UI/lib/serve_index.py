@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build ~/.hermes/asmr/serve-index/ as a flat symlink mirror of ASMR_LIBRARY_ROOT (default ~/ASMR)/.
+"""Build the ASMR stack serve-index as a flat symlink mirror of ASMR_LIBRARY_ROOT (default /Volumes/TOSHIBA/AMSR)/.
 
 One directory per work, one symlink per file. No bucketing — Neokikoeru's local
 storage driver walks RJ########/ in place and reads audio files where they are.
@@ -78,16 +78,16 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--source",
-        default=os.environ.get("ASMR_LIBRARY_ROOT", str(Path.home() / "ASMR")),
-        help="Library root (default:  or ~/ASMR).",
+        default=os.environ.get("ASMR_LIBRARY_ROOT") or os.environ.get("ASMR_MEDIA_ROOT") or "/Volumes/TOSHIBA/AMSR",
+        help="Library root (default: /Volumes/TOSHIBA/AMSR).",
     )
     parser.add_argument(
         "--index",
         default=os.environ.get(
             "ASMR_SERVE_INDEX_ROOT",
-            str(Path.home() / ".hermes" / "asmr" / "serve-index"),
+            str(Path(__file__).resolve().parent.parent / "serve-index"),
         ),
-        help="Symlink index root (default: ~/.hermes/asmr/serve-index).",
+        help="Symlink index root (default: <ASMR_STACK_ROOT>/serve-index).",
     )
     args = parser.parse_args()
     indexed, skipped, links = build_index(Path(args.source), Path(args.index))

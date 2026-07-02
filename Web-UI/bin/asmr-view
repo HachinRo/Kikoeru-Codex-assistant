@@ -56,15 +56,15 @@ import asmr_view_kikoeru as _kikoeru  # noqa: E402
 # Paths & config
 # ---------------------------------------------------------------------------
 
-HERMES_ASMR = Path.home() / ".hermes" / "asmr"
-CONFIG_PATH = HERMES_ASMR / "serve-config.json"
+STATE_ROOT = Path(os.environ.get("ASMR_STATE_ROOT") or os.environ.get("ASMR_STACK_ROOT") or Path(__file__).resolve().parent.parent)
+CONFIG_PATH = STATE_ROOT / "serve-config.json"
 ADMIN_DEFAULT_USER = "admin"
 ADMIN_DEFAULT_PASSWORD = "mygo"
 PROTECTED_DASHBOARD_ACTIONS = {"download", "retry", "fill"}
-VIEW_DIR = HERMES_ASMR / "view"
-KIKOERU_SPA_DIR = HERMES_ASMR / "kikoeru-spa"
-LOG_PATH = HERMES_ASMR / "asmr-view.log"
-PID_PATH = HERMES_ASMR / "asmr-view.pid"
+VIEW_DIR = STATE_ROOT / "view"
+KIKOERU_SPA_DIR = STATE_ROOT / "kikoeru-spa"
+LOG_PATH = STATE_ROOT / "asmr-view.log"
+PID_PATH = STATE_ROOT / "asmr-view.pid"
 
 NEOKIKOERU_DATA = Path.home() / "Library" / "Application Support" / "neokikoeru"
 NEOKIKOERU_DB = NEOKIKOERU_DATA / "neokikoeru.db"
@@ -80,7 +80,7 @@ def get_dashboard_module():
     global _DASHBOARD_MODULE
     if _DASHBOARD_MODULE is not None:
         return _DASHBOARD_MODULE
-    path = HERMES_ASMR / "bin" / "asmr-dashboard"
+    path = STATE_ROOT / "bin" / "asmr-dashboard"
     loader = importlib.machinery.SourceFileLoader("asmr_dashboard_embedded", str(path))
     spec = importlib.util.spec_from_loader("asmr_dashboard_embedded", loader)
     if spec is None:
@@ -91,20 +91,21 @@ def get_dashboard_module():
     return mod
 
 # Storage root where the actual mp3/wav/jpg files live.
-# Default: ~/ASMR/  (real files; DB stores paths like /RJ01010222/...mp3)
-# Override via env var ASMR_STORAGE_ROOT or serve-config.json "storage_root".
-_DEFAULT_STORAGE_ROOT = Path.home() / "ASMR"
+# Default: /Volumes/TOSHIBA/AMSR (real files; DB stores paths like /RJ01010222/...mp3)
+# Override via env var ASMR_STORAGE_ROOT, ASMR_LIBRARY_ROOT, ASMR_MEDIA_ROOT,
+# or serve-config.json "storage_root".
+_DEFAULT_STORAGE_ROOT = Path("/Volumes/TOSHIBA/AMSR")
 
 
 def get_storage_root() -> Path:
     """Resolve the on-disk storage root.
 
     Lookup order:
-      1. ASMR_STORAGE_ROOT env var
+      1. ASMR_STORAGE_ROOT / ASMR_LIBRARY_ROOT / ASMR_MEDIA_ROOT env var
       2. serve-config.json "storage_root" key
-      3. ~/ASMR (the default)
+      3. /Volumes/TOSHIBA/AMSR (the default)
     """
-    env = os.environ.get("ASMR_STORAGE_ROOT")
+    env = os.environ.get("ASMR_STORAGE_ROOT") or os.environ.get("ASMR_LIBRARY_ROOT") or os.environ.get("ASMR_MEDIA_ROOT")
     if env:
         return Path(env)
     if CONFIG_PATH.exists():
@@ -121,6 +122,10 @@ def get_storage_root() -> Path:
 # ---------------------------------------------------------------------------
 
 _state = threading.local()
+_DURATION_CACHE_VERSION = 1
+DURATION_CACHE_PATH = STATE_ROOT / "audio-duration-cache.json"
+_duration_cache_lock = threading.RLock()
+_duration_cache_data: dict | None = None
 
 
 def get_db() -> sqlite3.Connection:
@@ -136,6 +141,265 @@ def get_write_db() -> sqlite3.Connection:
     conn = sqlite3.connect(str(NEOKIKOERU_DB), timeout=30)
     conn.row_factory = sqlite3.Row
     return conn
+
+
+def _row_get(row, key: str, default=None):
+    try:
+        return row[key]
+    except (IndexError, KeyError, TypeError):
+        return default
+
+
+def _real_path_from_db_path(rel_path: str | None) -> Path:
+    rel_path = rel_path or ""
+    if rel_path.startswith("/"):
+        return get_storage_root() / rel_path.lstrip("/")
+    return get_storage_root() / rel_path
+
+
+def _is_duration_media(name: str | None) -> bool:
+    suffix = Path(name or "").suffix.lower()
+    return suffix in _kikoeru.AUDIO_EXTS or suffix in _kikoeru.VIDEO_EXTS
+
+
+def _load_duration_cache_locked() -> dict:
+    global _duration_cache_data
+    if _duration_cache_data is not None:
+        return _duration_cache_data
+    data = {"version": _DURATION_CACHE_VERSION, "durations": {}}
+    try:
+        raw = json.loads(DURATION_CACHE_PATH.read_text(encoding="utf-8"))
+        if isinstance(raw, dict):
+            entries = raw.get("durations")
+            if isinstance(entries, dict):
+                data["durations"] = entries
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        sys.stderr.write(f"duration cache load failed: {e}\n")
+    _duration_cache_data = data
+    return data
+
+
+def _write_duration_cache_locked() -> None:
+    if _duration_cache_data is None:
+        return
+    payload = dict(_duration_cache_data)
+    payload["version"] = _DURATION_CACHE_VERSION
+    payload["updated_at"] = int(time.time())
+    tmp = Path(str(DURATION_CACHE_PATH) + ".tmp")
+    try:
+        DURATION_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        os.replace(tmp, DURATION_CACHE_PATH)
+    except Exception as e:
+        sys.stderr.write(f"duration cache write failed: {e}\n")
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+
+
+def _duration_cache_entry_valid(entry, row, real: Path) -> bool:
+    if not isinstance(entry, dict):
+        return False
+    try:
+        duration = float(entry.get("duration") or 0)
+    except (TypeError, ValueError):
+        return False
+    if duration <= 0:
+        return False
+    rel_path = str(_row_get(row, "path") or "")
+    if entry.get("path") and entry.get("path") != rel_path:
+        return False
+    row_size = int(_row_get(row, "size") or 0)
+    try:
+        cached_size = int(entry.get("size") or 0)
+    except (TypeError, ValueError):
+        cached_size = 0
+    if row_size and cached_size and row_size != cached_size:
+        return False
+    if real.is_file():
+        try:
+            stat = real.stat()
+        except OSError:
+            return False
+        if cached_size and cached_size != stat.st_size:
+            return False
+        try:
+            cached_mtime = float(entry.get("mtime") or 0)
+        except (TypeError, ValueError):
+            cached_mtime = 0
+        if cached_mtime and abs(cached_mtime - stat.st_mtime) > 1:
+            return False
+    return True
+
+
+def _cached_duration_for_file(row) -> float:
+    file_id = str(_row_get(row, "id") or "")
+    if not file_id:
+        return 0.0
+    real = _real_path_from_db_path(str(_row_get(row, "path") or ""))
+    with _duration_cache_lock:
+        cache = _load_duration_cache_locked()
+        entry = cache.get("durations", {}).get(file_id)
+        if not _duration_cache_entry_valid(entry, row, real):
+            return 0.0
+        try:
+            return float(entry.get("duration") or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+
+def _store_duration_for_file(row, duration: float, source: str = "ffprobe") -> None:
+    if duration <= 0:
+        return
+    file_id = str(_row_get(row, "id") or "")
+    if not file_id:
+        return
+    rel_path = str(_row_get(row, "path") or "")
+    real = _real_path_from_db_path(rel_path)
+    row_size = int(_row_get(row, "size") or 0)
+    entry = {
+        "duration": round(float(duration), 6),
+        "path": rel_path,
+        "size": row_size,
+        "source": source,
+        "updated_at": int(time.time()),
+    }
+    if real.is_file():
+        try:
+            stat = real.stat()
+            entry["size"] = stat.st_size
+            entry["mtime"] = stat.st_mtime
+        except OSError:
+            pass
+    with _duration_cache_lock:
+        cache = _load_duration_cache_locked()
+        durations = cache.setdefault("durations", {})
+        existing = durations.get(file_id)
+        if _duration_cache_entry_valid(existing, row, real):
+            try:
+                existing_duration = float(existing.get("duration") or 0)
+            except (TypeError, ValueError):
+                existing_duration = 0
+            if abs(existing_duration - duration) < 0.001:
+                return
+        durations[file_id] = entry
+        _write_duration_cache_locked()
+
+
+def _probe_media_duration(real: Path) -> float:
+    if not real.is_file():
+        return 0.0
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe:
+        return 0.0
+    try:
+        proc = subprocess.run(
+            [
+                ffprobe,
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+                str(real),
+            ],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=20,
+        )
+    except Exception as e:
+        sys.stderr.write(f"duration probe failed for {real}: {e}\n")
+        return 0.0
+    if proc.returncode != 0:
+        return 0.0
+    try:
+        duration = float(proc.stdout.strip())
+    except (TypeError, ValueError):
+        return 0.0
+    return duration if duration > 0 else 0.0
+
+
+def duration_for_file_row(row, allow_probe: bool = True) -> float:
+    if bool(_row_get(row, "is_folder")):
+        return 0.0
+    try:
+        stored = float(_row_get(row, "duration") or 0)
+    except (TypeError, ValueError):
+        stored = 0.0
+    if stored > 0:
+        return stored
+    cached = _cached_duration_for_file(row)
+    if cached > 0:
+        return cached
+    name = str(_row_get(row, "name") or "")
+    if not allow_probe or not _is_duration_media(name):
+        return 0.0
+    real = _real_path_from_db_path(str(_row_get(row, "path") or ""))
+    probed = _probe_media_duration(real)
+    if probed > 0:
+        _store_duration_for_file(row, probed)
+        return probed
+    return 0.0
+
+
+_USER_ID = 1
+_USER_REVIEW_TABLE = "asmr_view_user_reviews"
+_user_review_table_ready = False
+_user_review_table_lock = threading.Lock()
+
+
+def ensure_user_review_table(conn: sqlite3.Connection | None = None) -> None:
+    """Create local per-user review/rating storage if needed."""
+    global _user_review_table_ready
+    if _user_review_table_ready:
+        return
+    with _user_review_table_lock:
+        if _user_review_table_ready:
+            return
+        own_conn = conn is None
+        db = conn or get_write_db()
+        try:
+            db.execute(
+                f"""
+                CREATE TABLE IF NOT EXISTS {_USER_REVIEW_TABLE} (
+                    user_id INTEGER NOT NULL,
+                    work_id TEXT NOT NULL,
+                    rating REAL NOT NULL DEFAULT 0,
+                    review_text TEXT NOT NULL DEFAULT '',
+                    progress TEXT NOT NULL DEFAULT '',
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    PRIMARY KEY (user_id, work_id)
+                )
+                """
+            )
+            db.execute(
+                f"""
+                CREATE INDEX IF NOT EXISTS idx_{_USER_REVIEW_TABLE}_updated
+                ON {_USER_REVIEW_TABLE} (user_id, updated_at DESC)
+                """
+            )
+            db.execute(
+                f"""
+                CREATE INDEX IF NOT EXISTS idx_{_USER_REVIEW_TABLE}_rating
+                ON {_USER_REVIEW_TABLE} (user_id, rating DESC)
+                """
+            )
+            if own_conn:
+                db.commit()
+        finally:
+            if own_conn:
+                db.close()
+        close_read_db()
+        _user_review_table_ready = True
 
 
 def close_read_db() -> None:
@@ -250,11 +514,16 @@ SELECT
     w.age_category, w.image_main, w.image_thumb,
     w.created_at, w.updated_at, w.released_at,
     m.id AS maker_id, m.name AS maker_name,
+    ur.rating AS user_rating,
+    ur.review_text AS user_review_text,
+    ur.progress AS user_progress,
+    ur.updated_at AS user_updated_at,
     (SELECT COUNT(*) FROM files f WHERE f.work_id = w.id AND f.is_folder = 1) AS folder_count,
     (SELECT COUNT(*) FROM files fi WHERE fi.work_id = w.id AND (fi.is_folder IS NULL OR fi.is_folder = 0)) AS file_count,
     (SELECT COALESCE(SUM(size), 0) FROM files fi WHERE fi.work_id = w.id AND (fi.is_folder IS NULL OR fi.is_folder = 0)) AS total_size
 FROM works w
 LEFT JOIN makers m ON w.maker_id = m.id
+LEFT JOIN asmr_view_user_reviews ur ON ur.work_id = w.id AND ur.user_id = 1
 """
 
 
@@ -271,11 +540,9 @@ LEFT JOIN makers m ON w.maker_id = m.id
 #     Lexicographic on the full id would put 8-digit codes first
 #     by mistake (since '0' < '4'). We CAST(SUBSTR(id,3) AS INT) to
 #     get a real numeric compare.
-#   * `random` — uses the `seed` query param so the same seed gives
-#     a stable order across paginated requests. The SPA picks a new
-#     random seed whenever the sort option changes or the user
-#     navigates back; subsequent pages of the same view reuse the
-#     same seed.
+#   * `random` — delegates to SQLite's RANDOM() so every request gets
+#     a fresh random ordering. The SPA may still send a seed query param
+#     from older behavior, but we ignore it for real random sorting.
 #   * `nsfw` — kikoeru sends `sort=asc` to mean "全年龄新作优先"
 #     (all-ages new releases first). Age category 0=ALL, 1=R15,
 #     2=R18, so ASC by age_category puts ALL first; we also tie-
@@ -284,11 +551,13 @@ LEFT JOIN makers m ON w.maker_id = m.id
 _SORT_MAP = {
     "id":              "CAST(SUBSTR(w.id, 3) AS INTEGER)",
     "release":         "w.released_at",
-    "rating":          "w.rating",
+    "rating":          "COALESCE(ur.rating, 0)",
+    "userRating":      "COALESCE(ur.rating, 0)",
     "dl_count":        "w.sales",
     "price":           "w.price",
     "rate_average_2dp": "w.rating",
     "review_count":    "w.review_count",
+    "updated_at":      "COALESCE(ur.updated_at, w.updated_at)",
     "nsfw":            "w.age_category, w.released_at",
 }
 
@@ -300,12 +569,7 @@ def _order_sql(order: str, sort: str, seed: int) -> str:
     if order == "betterRandom":
         return "RANDOM()"
     if order == "random":
-        if not seed:
-            seed = time.time_ns() & 0xffff
-        return (
-            f"((CAST(SUBSTR(w.id, 3) AS INTEGER) * {int(seed) & 0xffff} "
-            "* 2654435761) % 2147483647), w.id DESC"
-        )
+        return "RANDOM()"
     col = _SORT_MAP.get(order, "CAST(SUBSTR(w.id, 3) AS INTEGER)")
     return f"{col} {direction.upper()}, w.id DESC"
 
@@ -321,10 +585,10 @@ def list_works(
     """Paginated work list for the kikoeru `/api/works` endpoint.
 
     `order`/`sort` mirror the kikoeru-quasar SPA's sort dropdown
-    (see `Works.vue` `sortOption`). When `order == "random"` the
-    `seed` parameter is used as the SQLite random seed so paginated
-    requests for the same view return a stable order.
+    (see `Works.vue` `sortOption`). When `order == "random"` SQLite's
+    RANDOM() is used so each request gets a fresh random order.
     """
+    ensure_user_review_table()
     conn = get_db()
     offset = (page - 1) * size
     where = ""
@@ -367,16 +631,7 @@ WHERE
     if order == "betterRandom":
         order_sql = "RANDOM()"
     elif order == "random":
-        # PRAGMA random_seed doesn't make RANDOM() reproducible in
-        # SQLite, so we use a deterministic transform on the row's
-        # id + the request's seed. The Knuth multiplicative hash
-        # gives good distribution; the seed is multiplied by a
-        # large prime so different seeds produce different orders
-        # even for small changes.
-        order_sql = (
-            f"((CAST(SUBSTR(w.id, 3) AS INTEGER) * {int(seed) & 0xffff} "
-            "* 2654435761) % 2147483647)"
-        )
+        order_sql = "RANDOM()"
     else:
         col = _SORT_MAP.get(order, "CAST(SUBSTR(w.id, 3) AS INTEGER)")
         order_sql = f"{col} {direction.upper()}, w.id DESC"
@@ -411,6 +666,7 @@ def list_works_by_relation(
     seed: int = 0,
 ) -> dict:
     """Paginated exact group/tag/VA work list for kikoeru relation routes."""
+    ensure_user_review_table()
     conn = get_db()
     offset = (page - 1) * size
     relation_sql = {
@@ -492,11 +748,72 @@ def relation_list(relation: str) -> list[dict]:
 
 
 def get_work(rj: str) -> dict | None:
+    ensure_user_review_table()
     conn = get_db()
     row = conn.execute(f"{WORK_SELECT} WHERE w.id = ?", (rj,)).fetchone()
     if row is None:
         return None
     return _row_to_kikoeru_work(row, include_extras=True)
+
+
+def list_user_reviews(
+    page: int = 1,
+    size: int = 12,
+    order: str = "updated_at",
+    sort: str = "desc",
+    progress_filter: str = "",
+) -> dict:
+    """Paginated works with locally saved ratings/reviews."""
+    ensure_user_review_table()
+    conn = get_db()
+    offset = (page - 1) * size
+    where = (
+        "WHERE ur.user_id = ? "
+        "AND (ur.rating > 0 OR ur.review_text != '' OR ur.progress != '')"
+    )
+    params: list = [_USER_ID]
+    if progress_filter:
+        if progress_filter in {"marked", "listening", "listened", "replay", "postponed"}:
+            where += " AND ur.progress = ?"
+            params.append(progress_filter)
+        elif progress_filter in {"unmarked", "none"}:
+            where += " AND ur.progress = ''"
+        elif progress_filter != "all":
+            where += " AND ur.progress = ?"
+            params.append(progress_filter)
+    total = conn.execute(
+        f"SELECT COUNT(*) FROM works w "
+        f"LEFT JOIN makers m ON w.maker_id = m.id "
+        f"LEFT JOIN {_USER_REVIEW_TABLE} ur ON ur.work_id = w.id AND ur.user_id = {_USER_ID} "
+        f"{where}",
+        params,
+    ).fetchone()[0]
+    rows = conn.execute(
+        f"{WORK_SELECT} {where} "
+        f"ORDER BY {_order_sql(order, sort, 0)} LIMIT ? OFFSET ?",
+        [*params, size, offset],
+    ).fetchall()
+    works = [_row_to_kikoeru_work(r) for r in rows]
+    return {
+        "pagination": {"totalCount": total, "currentPage": page, "pageSize": size},
+        "page": page,
+        "size": size,
+        "total": total,
+        "works": works,
+        "reviews": works,
+    }
+
+
+def _normalize_work_id(value, conn: sqlite3.Connection | None = None) -> str | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    if re.match(r"^RJ\d+$", raw, re.IGNORECASE):
+        return raw.upper()
+    if raw.isdigit():
+        db = conn or get_db()
+        return _kikoeru.resolve_rj(db, int(raw))
+    return None
 
 
 def _row_to_kikoeru_work(row: sqlite3.Row, include_extras: bool = True) -> dict:
@@ -519,6 +836,11 @@ def _row_to_kikoeru_work(row: sqlite3.Row, include_extras: bool = True) -> dict:
     rating = float(row["rating"] or 0)
     rating_count = int(row["rating_count"] or 0)
     review_count = int(row["review_count"] or 0)
+    user_rating = float(row["user_rating"] or 0)
+    user_review_text = row["user_review_text"] or ""
+    user_progress = row["user_progress"] or ""
+    user_updated_at = int(row["user_updated_at"] or 0)
+    is_favourite = bool(user_updated_at or user_rating or user_review_text or user_progress)
 
     # Kikoeru uses {circle: {id, name}} and {vas: [{id, name}, ...]}
     maker = row["maker_name"] or ""
@@ -544,8 +866,11 @@ def _row_to_kikoeru_work(row: sqlite3.Row, include_extras: bool = True) -> dict:
         "nsfw": int(row["age_category"] or 0) >= 2,
         "release": released,
         "create_date": _kikoeru._ts_to_date(row["created_at"]),
-        "userRating": 0,
-        "isFavourite": False,
+        "userRating": user_rating,
+        "isFavourite": is_favourite,
+        "review_text": user_review_text,
+        "progress": user_progress,
+        "updated_at": user_updated_at or int(row["updated_at"] or 0),
         "type": "doujin",
         "coverUrl": f"/api/covers/{rj_id}",
     }
@@ -648,7 +973,7 @@ def list_files(rj: str, folder_path: str = "") -> dict:
             "id": r["id"],
             "name": r["name"],
             "size": int(r["size"] or 0),
-            "duration": float(r["duration"] or 0),
+            "duration": duration_for_file_row(r),
             "is_folder": is_folder,
             "parent_id": r["parent_id"],
             "path": r["path"],
@@ -693,6 +1018,10 @@ class AsmrViewHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         """Handle POST requests (used by kikoeru /api/auth/me login and admin reindex)."""
         self._dispatch_post()
+
+    def do_PUT(self):
+        """Handle kikoeru review/mylist updates."""
+        self._dispatch_put()
 
     def do_DELETE(self):
         """Handle destructive admin requests."""
@@ -750,18 +1079,20 @@ class AsmrViewHandler(BaseHTTPRequestHandler):
                     payload = {}
                 if name == "fix-covers":
                     sample_rj = dash.rj_arg(payload.get("rj", "RJ01580504") or "RJ01580504")
-                    rec = dash.queue_action("fix-covers", [str(HERMES_ASMR / "bin" / "asmr-fix-covers-workflow"), sample_rj], timeout=1800)
+                    rec = dash.queue_action("fix-covers", [str(STATE_ROOT / "bin" / "asmr-fix-covers-workflow"), sample_rj], timeout=1800)
                 elif name == "reindex":
-                    rec = dash.queue_action("reindex", [str(HERMES_ASMR / "bin" / "asmr-library"), "reindex"], timeout=1800)
+                    rec = dash.queue_action("reindex", [str(STATE_ROOT / "bin" / "asmr-library"), "reindex"], timeout=1800)
+                elif name == "subs-search":
+                    rec = dash.queue_action("subs-search", [str(STATE_ROOT / "bin" / "asmr-library"), "subs", "search-missing"], timeout=3600)
                 else:
                     rj = dash.rj_arg(payload.get("rj", ""))
                     mapping = {
-                        "download": [str(HERMES_ASMR / "bin" / "asmr-library"), "download", rj],
-                        "retry": [str(HERMES_ASMR / "bin" / "asmr-library"), "retry", rj],
-                        "fill": [str(HERMES_ASMR / "bin" / "asmr-library"), "fill", rj],
-                        "fix-content": [str(HERMES_ASMR / "bin" / "asmr-fix-content-workflow"), rj],
-                        "subs-dry-run": [str(HERMES_ASMR / "bin" / "asmr-library"), "subs", "fetch", rj, "--dry-run"],
-                        "subs-fetch": [str(HERMES_ASMR / "bin" / "asmr-library"), "subs", "fetch", rj],
+                        "download": [str(STATE_ROOT / "bin" / "asmr-library"), "download", rj],
+                        "retry": [str(STATE_ROOT / "bin" / "asmr-library"), "retry", rj],
+                        "fill": [str(STATE_ROOT / "bin" / "asmr-library"), "fill", rj],
+                        "fix-content": [str(STATE_ROOT / "bin" / "asmr-fix-content-workflow"), rj],
+                        "subs-dry-run": [str(STATE_ROOT / "bin" / "asmr-library"), "subs", "fetch", rj, "--dry-run"],
+                        "subs-fetch": [str(STATE_ROOT / "bin" / "asmr-library"), "subs", "fetch", rj],
                     }
                     if name not in mapping:
                         self._json({"error": "unknown action"}, 404)
@@ -788,6 +1119,28 @@ class AsmrViewHandler(BaseHTTPRequestHandler):
             sys.stderr.write("--- POST " + traceback.format_exc() + "\n")
             self._json({"error": str(e), "type": type(e).__name__}, 500)
 
+    def _dispatch_put(self):
+        url = urllib.parse.urlparse(self.path)
+        path = url.path
+        try:
+            try:
+                clen = int(self.headers.get("Content-Length", "0"))
+            except ValueError:
+                clen = 0
+            body = self.rfile.read(clen) if clen > 0 else b""
+            if path.startswith("/api/review"):
+                self._kikoeru_review_put(path, body)
+            elif path.startswith("/api/mylist"):
+                self._kikoeru_mylist_post(path, body)
+            else:
+                self._json({"error": "not found", "method": "PUT", "path": path}, 404)
+        except BrokenPipeError:
+            pass
+        except Exception as e:
+            import traceback
+            sys.stderr.write("--- PUT " + traceback.format_exc() + "\n")
+            self._json({"error": str(e), "type": type(e).__name__}, 500)
+
     def _dispatch_delete(self):
         url = urllib.parse.urlparse(self.path)
         path = url.path
@@ -797,7 +1150,9 @@ class AsmrViewHandler(BaseHTTPRequestHandler):
             except ValueError:
                 clen = 0
             body = self.rfile.read(clen) if clen > 0 else b""
-            if path.startswith("/api/work/"):
+            if path.startswith("/api/review"):
+                self._kikoeru_review_delete(path, body)
+            elif path.startswith("/api/work/"):
                 self._api_delete_work(path[len("/api/work/"):].strip("/"), body)
             elif path.startswith("/api/works/"):
                 self._api_delete_work(path[len("/api/works/"):].strip("/"), body)
@@ -823,8 +1178,120 @@ class AsmrViewHandler(BaseHTTPRequestHandler):
         })
 
     def _kikoeru_review_post(self, path: str, body: bytes):
-        """Stub: accept reviews but don't persist."""
-        self._json({"ok": True, "review": None})
+        """Accept review writes from clients that POST instead of PUT."""
+        self._kikoeru_review_put(path, body)
+
+    def _kikoeru_review_put(self, path: str, body: bytes):
+        """Persist kikoeru-quasar user ratings/reviews locally."""
+        try:
+            payload = json.loads(body.decode("utf-8")) if body else {}
+        except json.JSONDecodeError:
+            self._json({"error": "invalid json body"}, 400)
+            return
+        conn = get_write_db()
+        try:
+            rj = _normalize_work_id(payload.get("work_id") or payload.get("workId") or payload.get("id"), conn)
+            if rj is None:
+                self._json({"error": "invalid work_id"}, 400)
+                return
+            exists = conn.execute("SELECT id FROM works WHERE id = ?", (rj,)).fetchone()
+            if exists is None:
+                self._json({"error": "work not found", "work_id": rj}, 404)
+                return
+            ensure_user_review_table(conn)
+            current = conn.execute(
+                f"""
+                SELECT rating, review_text, progress, created_at
+                FROM {_USER_REVIEW_TABLE}
+                WHERE user_id = ? AND work_id = ?
+                """,
+                (_USER_ID, rj),
+            ).fetchone()
+            now = int(time.time() * 1000)
+            rating = float(current["rating"] or 0) if current else 0.0
+            review_text = current["review_text"] if current else ""
+            progress = current["progress"] if current else ""
+            created_at = int(current["created_at"] or now) if current else now
+            if "rating" in payload and payload.get("rating") not in (None, ""):
+                try:
+                    rating = float(payload.get("rating"))
+                except (TypeError, ValueError):
+                    self._json({"error": "rating must be a number"}, 400)
+                    return
+                if rating < 0 or rating > 5:
+                    self._json({"error": "rating must be between 0 and 5"}, 400)
+                    return
+            if "review_text" in payload:
+                review_text = str(payload.get("review_text") or "")
+            elif "reviewText" in payload:
+                review_text = str(payload.get("reviewText") or "")
+            elif "text" in payload:
+                review_text = str(payload.get("text") or "")
+            if "progress" in payload:
+                progress = str(payload.get("progress") or "")
+            conn.execute(
+                f"""
+                INSERT INTO {_USER_REVIEW_TABLE}
+                    (user_id, work_id, rating, review_text, progress, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(user_id, work_id) DO UPDATE SET
+                    rating = excluded.rating,
+                    review_text = excluded.review_text,
+                    progress = excluded.progress,
+                    updated_at = excluded.updated_at
+                """,
+                (_USER_ID, rj, rating, review_text, progress, created_at, now),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        close_read_db()
+        self._json({
+            "ok": True,
+            "message": "Rating saved",
+            "review": {
+                "work_id": rj,
+                "rating": rating,
+                "review_text": review_text,
+                "progress": progress,
+                "updated_at": now,
+            },
+        })
+
+    def _kikoeru_review_delete(self, path: str, body: bytes):
+        url = urllib.parse.urlparse(self.path)
+        qs = urllib.parse.parse_qs(url.query)
+        payload = {}
+        if body:
+            try:
+                payload = json.loads(body.decode("utf-8"))
+            except json.JSONDecodeError:
+                payload = {}
+        raw_id = (
+            qs.get("work_id", [""])[0]
+            or qs.get("workId", [""])[0]
+            or qs.get("id", [""])[0]
+            or payload.get("work_id")
+            or payload.get("workId")
+            or payload.get("id")
+            or path.removeprefix("/api/review/").strip("/")
+        )
+        conn = get_write_db()
+        try:
+            rj = _normalize_work_id(raw_id, conn)
+            if rj is None:
+                self._json({"error": "invalid work_id"}, 400)
+                return
+            ensure_user_review_table(conn)
+            conn.execute(
+                f"DELETE FROM {_USER_REVIEW_TABLE} WHERE user_id = ? AND work_id = ?",
+                (_USER_ID, rj),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        close_read_db()
+        self._json({"ok": True, "message": "Rating removed", "work_id": rj})
 
     def _kikoeru_mylist_post(self, path: str, body: bytes):
         """Stub: accept mylist updates but don't persist."""
@@ -970,6 +1437,9 @@ class AsmrViewHandler(BaseHTTPRequestHandler):
                 or path.startswith("/fonts/") or path.startswith("/statics/")
             ):
                 self._serve_spa_static(path)
+            elif path.startswith("/work/"):
+                if not self._redirect_canonical_work_route(path, url.query, head=head):
+                    self._serve_spa(head=head)
             # SPA history fallback: any other non-/api GET that doesn't look like
             # a file (no extension) -> serve the SPA shell so vue-router can take
             # over. This handles direct hits like /work/1010222, /library, etc.
@@ -1005,6 +1475,27 @@ class AsmrViewHandler(BaseHTTPRequestHandler):
         self.end_headers()
         if not head:
             self.wfile.write(body)
+
+    def _redirect(self, location: str, status: HTTPStatus = HTTPStatus.FOUND, head: bool = False):
+        self.send_response(status)
+        self.send_header("Location", location)
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+
+    def _redirect_canonical_work_route(self, path: str, query: str = "", head: bool = False) -> bool:
+        raw = urllib.parse.unquote(path[len("/work/"):]).strip("/")
+        if not raw or "/" in raw:
+            return False
+        canonical = _normalize_work_id(raw)
+        if not canonical:
+            return False
+        target = "/work/" + urllib.parse.quote(canonical, safe="")
+        if target == path:
+            return False
+        if query:
+            target += "?" + query
+        self._redirect(target, head=head)
+        return True
 
     def _serve_asmr_library_dashboard(self, head: bool = False):
         dash = get_dashboard_module()
@@ -1267,7 +1758,7 @@ class AsmrViewHandler(BaseHTTPRequestHandler):
     def _api_duration(self, file_id: str):
         conn = get_db()
         row = conn.execute(
-            "SELECT id, name, duration FROM files WHERE id = ?",
+            "SELECT id, name, path, size, duration, is_folder FROM files WHERE id = ?",
             (file_id,),
         ).fetchone()
         if row is None:
@@ -1276,7 +1767,7 @@ class AsmrViewHandler(BaseHTTPRequestHandler):
         self._json({
             "id": row["id"],
             "name": row["name"],
-            "duration": float(row["duration"] or 0),
+            "duration": duration_for_file_row(row),
         })
 
     def _count_works(self) -> int:
@@ -1337,16 +1828,14 @@ class AsmrViewHandler(BaseHTTPRequestHandler):
     def _kikoeru_empty_favourites(self, qs: dict):
         try:
             page = int(qs.get("page", ["1"])[0])
+            size = int(qs.get("size", ["12"])[0])
         except ValueError:
-            page = 1
-        self._json({
-            "pagination": {"totalCount": 0, "currentPage": page, "pageSize": 12},
-            "page": page,
-            "size": 12,
-            "total": 0,
-            "works": [],
-            "reviews": [],
-        })
+            page, size = 1, 12
+        size = min(max(size, 1), 200)
+        order = (qs.get("order", ["updated_at"])[0] or "updated_at").strip()
+        sort = (qs.get("sort", ["desc"])[0] or "desc").strip()
+        progress_filter = (qs.get("filter", [""])[0] or "").strip()
+        self._json(list_user_reviews(page, size, order, sort, progress_filter))
 
     def _kikoeru_relation_works(self, relation: str, raw_id: str, qs: dict):
         try:
@@ -1389,7 +1878,7 @@ class AsmrViewHandler(BaseHTTPRequestHandler):
         if rj is None:
             self._json({"error": "work not found", "id": wid}, 404)
             return
-        tree = _kikoeru.build_tree(get_db(), rj)
+        tree = _kikoeru.build_tree(get_db(), rj, duration_resolver=duration_for_file_row)
         self._json(tree)
 
     def _kikoeru_stream(self, file_hash: str, qs: dict, head: bool = False):
@@ -1398,7 +1887,7 @@ class AsmrViewHandler(BaseHTTPRequestHandler):
         Resolution order:
           1. Look up `files.path` in the DB. Path is stored as e.g.
              ``/RJ01010222/...mp3``; prepend the storage root
-             (default ~/ASMR) to get the real file.
+             (default /Volumes/TOSHIBA/AMSR) to get the real file.
           2. If the file exists on disk, stream it directly with full
              HTTP Range support so the player can seek.
           3. Fall back to Neokikoeru's unencrypted /fs/download proxy
@@ -1767,6 +2256,7 @@ class AsmrViewHandler(BaseHTTPRequestHandler):
             wid = _kikoeru.rj_to_numeric(row["work_id"])
         except Exception:
             wid = 0
+        rj_id = row["work_id"] or ""
         out = {
             "hash": row["id"],
             "title": name,
@@ -1775,9 +2265,12 @@ class AsmrViewHandler(BaseHTTPRequestHandler):
             "mediaStreamUrl": f"/api/media/stream/{row['id']}" if not is_folder else None,
             "mediaDownloadUrl": f"/api/media/download/{row['id']}" if not is_folder else None,
             "work_id": wid,
+            "rj_id": rj_id,
+            "rjId": rj_id,
+            "work_rj": rj_id,
             "work_name": "",
             "size": int(row["size"] or 0),
-            "duration": float(row["duration"] or 0),
+            "duration": duration_for_file_row(row),
         }
         self._json(out)
 
@@ -1838,10 +2331,10 @@ class AsmrViewHandler(BaseHTTPRequestHandler):
         return False
 
     def _run_reindex_command(self) -> dict:
-        cmd = [str(HERMES_ASMR / "bin" / "asmr-library"), "build"]
+        cmd = [str(STATE_ROOT / "bin" / "asmr-library"), "build"]
         proc = subprocess.run(
             cmd,
-            cwd=str(HERMES_ASMR),
+            cwd=str(STATE_ROOT),
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -1953,12 +2446,12 @@ class AsmrViewHandler(BaseHTTPRequestHandler):
 
     def _admin_reindex(self):
         """Trigger metadata/cover reindex only, then refresh our cache."""
-        cmd = [str(HERMES_ASMR / "bin" / "asmr-library"), "reindex"]
-        poll_cmd = [str(HERMES_ASMR / "bin" / "asmr-library"), "serve", "tasks"]
+        cmd = [str(STATE_ROOT / "bin" / "asmr-library"), "reindex"]
+        poll_cmd = [str(STATE_ROOT / "bin" / "asmr-library"), "serve", "tasks"]
         try:
             proc = subprocess.run(
                 cmd,
-                cwd=str(HERMES_ASMR),
+                cwd=str(STATE_ROOT),
                 text=True,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
@@ -1976,7 +2469,7 @@ class AsmrViewHandler(BaseHTTPRequestHandler):
                 while True:
                     task_proc = subprocess.run(
                         poll_cmd,
-                        cwd=str(HERMES_ASMR),
+                        cwd=str(STATE_ROOT),
                         text=True,
                         stdout=subprocess.PIPE,
                         stderr=subprocess.STDOUT,

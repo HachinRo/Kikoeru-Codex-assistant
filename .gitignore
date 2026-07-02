@@ -238,7 +238,9 @@ hermes-asmr-copy/
 Web-UI/-/
 Web-UI/-
 Web-UI/.asmr-one-cookies.txt
+Web-UI/.asmr-subtitle-availability.json
 Web-UI/.asmroner-data/
+Web-UI/audio-duration-cache.json
 Web-UI/*.log
 Web-UI/*.pid
 Web-UI/serve-config.json
