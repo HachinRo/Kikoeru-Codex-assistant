@@ -196,23 +196,35 @@
             poll()
           })
         }
-        function runWorkRefresh (rj) {
-          return jsonFetch('/api/asmr-library/actions/fix-content', {
-            method: 'POST',
-            headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({rj: rj})
-          }).then(function (action) {
-            return waitAction(action.id)
-          }).then(function () {
-            return jsonFetch('/api/admin/reindex', { method: 'POST' })
-          })
-        }
-        btn.addEventListener('click', function () {
-          var old = btn.textContent
-          var rj = currentWorkRj()
-          btn.disabled = true
-          btn.textContent = '…'
-          var work = rj ? runWorkRefresh(rj) : jsonFetch('/api/admin/reindex', { method: 'POST' })
+function runWorkRefresh (rj) {
+ return jsonFetch('/api/asmr-library/actions/fix-content', {
+ method: 'POST',
+ headers: {'Content-Type': 'application/json'},
+ body: JSON.stringify({rj: rj})
+ }).then(function (action) {
+   return waitAction(action.id)
+ }).then(function () {
+   return jsonFetch('/api/admin/reindex', { method: 'POST' }).catch(function (err) {
+    console.warn('ASMR global reindex skipped after work refresh:', err)
+    return { ok: false, skipped: true, error: String(err && err.message || err) }
+ })
+ })
+ }
+ function runIndexRefresh () {
+ return jsonFetch('/api/asmr-library/actions/reindex', {
+ method: 'POST',
+ headers: {'Content-Type': 'application/json'},
+ body: JSON.stringify({})
+ }).then(function (action) {
+ return waitAction(action.id)
+ })
+ }
+ btn.addEventListener('click', function () {
+ var old = btn.textContent
+ var rj = currentWorkRj()
+ btn.disabled = true
+ btn.textContent = '…'
+ var work = rj ? runWorkRefresh(rj) : runIndexRefresh()
           work.then(function (res) {
               btn.textContent = '✓'
               console.log(rj ? 'ASMR work refresh result:' : 'ASMR index refresh result:', res)
@@ -289,5 +301,5 @@
         syncCover()
       }())
     </script>
-  <script type="text/javascript" src="/js/app.051b603f.fix7.js"></script><script type="text/javascript" src="/js/runtime.3597b51d.js"></script><script type="text/javascript" src="/js/vendor.86022408.js"></script></body>
+  <script type="text/javascript" src="/js/app.051b603f.fix10.js"></script><script type="text/javascript" src="/js/runtime.3597b51d.js"></script><script type="text/javascript" src="/js/vendor.86022408.js"></script><script type="text/javascript" src="/js/asmr-player-work-detail.js?v=fix11"></script><script type="text/javascript" src="/js/asmr-video-viewer.js?v=fix10"></script></body>
 </html>

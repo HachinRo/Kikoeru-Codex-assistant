@@ -5,8 +5,9 @@
 set -eu
 umask 077
 
-HERMES_ROOT="${HERMES_HOME:-${HOME}/.hermes}"
-STATE_ROOT="${HERMES_ASMR_HOME:-${HERMES_ROOT}/asmr}"
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)"
+DEFAULT_STATE_ROOT="$(CDPATH= cd -- "${SCRIPT_DIR}/.." && pwd -P)"
+STATE_ROOT="${ASMR_STATE_ROOT:-${ASMR_STACK_ROOT:-${DEFAULT_STATE_ROOT}}}"
 BIN="${STATE_ROOT}/bin/neokikoeru"
 LOG_DIR="${STATE_ROOT}/logs"
 INDEXER="${STATE_ROOT}/lib/serve_index.py"
@@ -15,7 +16,7 @@ LOG_FILE="${LOG_DIR}/serve.log"
 CONFIG_FILE="${STATE_ROOT}/serve-config.json"
 DEFAULT_PORT="8889"
 DEFAULT_ADMIN_USER="admin"
-LIBRARY_ROOT="${ASMR_LIBRARY_ROOT:-${HOME}/ASMR}"
+LIBRARY_ROOT="${ASMR_LIBRARY_ROOT:-${ASMR_MEDIA_ROOT:-/Volumes/TOSHIBA/AMSR}}"
 INDEX_ROOT="${ASMR_SERVE_INDEX_ROOT:-${STATE_ROOT}/serve-index}"
 NK_DATA_DIR="${HOME}/Library/Application Support/neokikoeru"
 NK_CONFIG="${NK_DATA_DIR}/config.json"
@@ -144,11 +145,19 @@ capture_admin_password() {
 }
 
 running_pid() {
-    [ -f "${PID_FILE}" ] || return 1
-    pid="$(cat "${PID_FILE}" 2>/dev/null || true)"
-    [ -n "${pid}" ] || return 1
-    kill -0 "${pid}" 2>/dev/null || return 1
-    printf '%s\n' "${pid}"
+ [ -f "${PID_FILE}" ] || return 1
+ pid="$(cat "${PID_FILE}" 2>/dev/null || true)"
+ [ -n "${pid}" ] || return 1
+ kill -0 "${pid}" 2>/dev/null || return 1
+ printf '%s\n' "${pid}"
+}
+
+port_pid() {
+ port="$1"
+ pid="$(lsof -tiTCP:"${port}" -sTCP:LISTEN 2>/dev/null | head -n 1 || true)"
+ [ -n "${pid}" ] || return 1
+ kill -0 "${pid}" 2>/dev/null || return 1
+ printf '%s\n' "${pid}"
 }
 
 cmd_init() {
@@ -206,11 +215,16 @@ cmd_start() {
         [ -d "${LIBRARY_ROOT}" ] || fail "library directory missing: ${LIBRARY_ROOT} (is the TOSHIBA drive mounted?)"
         python3 "${INDEXER}" --source "${LIBRARY_ROOT}" --index "${INDEX_ROOT}"
     fi
-    if pid="$(running_pid)"; then
-        say "Neokikoeru already running (PID ${pid}, port ${port})"
-        return 0
-    fi
-    : > "${LOG_FILE}"
+if pid="$(running_pid)"; then
+ say "Neokikoeru already running (PID ${pid}, port ${port})"
+ return 0
+fi
+if pid="$(port_pid "${port}")"; then
+ printf '%s\n' "${pid}" > "${PID_FILE}"
+ say "Neokikoeru already listening (PID ${pid}, port ${port})"
+ return 0
+fi
+: > "${LOG_FILE}"
     if [ "${foreground}" -eq 1 ]; then
         exec "${BIN}" serve
     fi
@@ -262,9 +276,10 @@ cmd_stop() {
 }
 
 cmd_status() {
-    if pid="$(running_pid)"; then
-        port="$(read_cfg port 2>/dev/null || echo "${DEFAULT_PORT}")"
-        user="$(read_cfg admin_user 2>/dev/null || echo "${DEFAULT_ADMIN_USER}")"
+ port="$(read_cfg port 2>/dev/null || echo "${DEFAULT_PORT}")"
+ if pid="$(running_pid)" || pid="$(port_pid "${port}")"; then
+ printf '%s\n' "${pid}" > "${PID_FILE}"
+ user="$(read_cfg admin_user 2>/dev/null || echo "${DEFAULT_ADMIN_USER}")"
         pw="$(read_cfg admin_password 2>/dev/null || true)"
         token="$(read_cfg token 2>/dev/null || true)"
         exp="$(read_cfg token_expires_at 2>/dev/null || true)"

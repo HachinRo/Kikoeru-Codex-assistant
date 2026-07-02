@@ -1,6 +1,6 @@
 #!/bin/sh
 # Idempotent fetch of the latest Neokikoeru binary from vscodev/neokikoeru
-# releases. Writes the resolved semver to ~/.hermes/asmr/neokikoeru.version.
+# releases. Writes the resolved semver to the ASMR stack root.
 #
 # Asset pattern (verified from expanded_assets on 2026-06-22):
 #   neokikoeru-macos-amd64.tar.gz
@@ -12,8 +12,9 @@
 set -eu
 umask 077
 
-HERMES_ROOT="${HERMES_HOME:-${HOME}/.hermes}"
-STATE_ROOT="${HERMES_ASMR_HOME:-${HERMES_ROOT}/asmr}"
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)"
+DEFAULT_STATE_ROOT="$(CDPATH= cd -- "${SCRIPT_DIR}/.." && pwd -P)"
+STATE_ROOT="${ASMR_STATE_ROOT:-${ASMR_STACK_ROOT:-${DEFAULT_STATE_ROOT}}}"
 BIN_DIR="${STATE_ROOT}/bin"
 VERSION_FILE="${STATE_ROOT}/neokikoeru.version"
 REPO="vscodev/neokikoeru"
