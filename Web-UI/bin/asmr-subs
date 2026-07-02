@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""asmr-subs: fetch Chinese subtitles from asmr.one into ASMR_LIBRARY_ROOT (default ~/ASMR).
+"""asmr-subs: fetch Chinese subtitles from asmr.one into ASMR_LIBRARY_ROOT (default /Volumes/TOSHIBA/AMSR).
 
 Usage:
   asmr-subs login <name> <password>      # one-time, persists session cookie
   asmr-subs check RJ01234567 [RJ...]     # report has_subtitle + sibling editions
   asmr-subs fetch RJ01234567 [RJ...]     # download subs to library, GB2312 -> UTF-8
   asmr-subs list-missing                 # scan library, list RJs with no on-disk subs
+  asmr-subs search-missing [RJ...]       # cache asmr.one subtitle availability for missing local subs
   asmr-subs fetch-missing [RJ...]        # fetch for all RJs in library that have no on-disk subs
 
 Cross-edition subtitle fetching (the main use case)
@@ -68,8 +69,11 @@ from pathlib import Path
 
 API_BASE = "https://api.asmr-200.com"
 APP_BASE = "https://asmr.one"
-LIBRARY_ROOT = Path(os.environ.get("ASMR_LIBRARY_ROOT", Path.home() / "ASMR"))
-COOKIE_JAR = Path.home() / ".hermes" / "asmr" / ".asmr-one-cookies.txt"
+LIBRARY_ROOT = Path(os.environ.get("ASMR_LIBRARY_ROOT") or os.environ.get("ASMR_MEDIA_ROOT") or "/Volumes/TOSHIBA/AMSR")
+DEFAULT_STATE_ROOT = Path(__file__).resolve().parent.parent
+STATE_ROOT = Path(os.environ.get("ASMR_STATE_ROOT") or os.environ.get("ASMR_STACK_ROOT") or DEFAULT_STATE_ROOT)
+COOKIE_JAR = STATE_ROOT / ".asmr-one-cookies.txt"
+SUBTITLE_AVAILABILITY_CACHE = STATE_ROOT / ".asmr-subtitle-availability.json"
 
 AUDIO_EXTS = {".mp3", ".wav", ".flac", ".m4a", ".aac", ".ogg", ".opus"}
 SUB_EXTS = (".vtt", ".srt", ".ass", ".lrc")
@@ -775,6 +779,44 @@ def fetch_one(opener, rj: str, dry_run: bool = False,
     return written
 
 
+def missing_local_subtitle_rjs(rjs: list[str] | None = None) -> list[str]:
+    """Return library RJ folders that have audio but no local subtitle files."""
+    sub_exts = {e.lower() for e in SUB_EXTS}
+    candidates = rjs
+    if candidates is None:
+        if not LIBRARY_ROOT.is_dir():
+            return []
+        candidates = [
+            p.name
+            for p in sorted(LIBRARY_ROOT.iterdir())
+            if p.is_dir() and RJ_RE.match(p.name)
+        ]
+
+    missing = []
+    for rj in candidates:
+        rj = rj.upper()
+        if not RJ_RE.match(rj):
+            continue
+        rj_dir = LIBRARY_ROOT / rj
+        if not rj_dir.is_dir():
+            continue
+        has_audio = any(
+            p.suffix.lower() in AUDIO_EXTS
+            for p in rj_dir.rglob("*")
+            if p.is_file()
+        )
+        if not has_audio:
+            continue
+        has_sub = any(
+            p.suffix.lower() in sub_exts
+            for p in rj_dir.rglob("*")
+            if p.is_file()
+        )
+        if not has_sub:
+            missing.append(rj)
+    return missing
+
+
 def cmd_list_missing(args):
     """Scan library for RJs with no on-disk subtitle files."""
     sub_exts = {e.lower() for e in SUB_EXTS}
@@ -793,6 +835,59 @@ def cmd_list_missing(args):
     for rj in missing:
         print(rj)
     print(f"\n{len(missing)} RJ folder(s) with no on-disk subtitles.", file=sys.stderr)
+
+
+def cmd_search_missing(args):
+    """Search asmr.one for local library works that still lack subtitles."""
+    opener = build_opener()
+    save_cookies(opener)
+    rjs = missing_local_subtitle_rjs(args.rjs or None)
+    checked_at = int(time.time())
+    available = []
+    unavailable = []
+    errors = []
+
+    print(f"Searching asmr.one subtitle availability for {len(rjs)} RJ folder(s) without local subs.")
+    for index, rj in enumerate(rjs, 1):
+        try:
+            siblings = discover_siblings(opener, rj)
+            source = pick_sub_source(siblings, rj) if siblings else None
+        except Exception as e:
+            errors.append({"rj": rj, "error": str(e)})
+            print(f"[{index}/{len(rjs)}] {rj}: search failed: {e}", file=sys.stderr)
+            continue
+
+        if source:
+            item = {
+                "rj": rj,
+                "source_rj": source.get("rj", rj),
+                "lang": source.get("lang", ""),
+                "lang_label": source.get("lang_label", ""),
+                "source": source.get("source", ""),
+                "checked_at": checked_at,
+            }
+            available.append(item)
+            via = "" if item["source_rj"] == rj else f" via {item['source_rj']}"
+            label = item["lang_label"] or item["lang"] or "subtitle"
+            print(f"[{index}/{len(rjs)}] {rj}: subtitle available{via} ({label})")
+        else:
+            unavailable.append(rj)
+            print(f"[{index}/{len(rjs)}] {rj}: no subtitle available")
+
+    cache = {
+        "checked_at": checked_at,
+        "library_root": str(LIBRARY_ROOT),
+        "available": available,
+        "unavailable": unavailable,
+        "errors": errors,
+    }
+    SUBTITLE_AVAILABILITY_CACHE.parent.mkdir(parents=True, exist_ok=True)
+    SUBTITLE_AVAILABILITY_CACHE.write_text(
+        json.dumps(cache, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    print(f"\n{len(available)} RJ folder(s) have asmr.one subtitles but no local subtitle files.")
+    print(f"Cache: {SUBTITLE_AVAILABILITY_CACHE}")
 
 
 def cmd_fetch_missing(args):
@@ -831,7 +926,7 @@ def main():
     p = sub.add_parser("check", help="check has_subtitle + sibling editions for given RJs")
     p.add_argument("rjs", nargs="+")
     p.set_defaults(func=cmd_check)
-    p = sub.add_parser("fetch", help="download subs for given RJs to ASMR_LIBRARY_ROOT (default ~/ASMR)")
+    p = sub.add_parser("fetch", help="download subs for given RJs to ASMR_LIBRARY_ROOT (default /Volumes/TOSHIBA/AMSR)")
     p.add_argument("rjs", nargs="+")
     p.add_argument("--dry-run", action="store_true",
                    help="show what would be written without downloading")
@@ -841,6 +936,10 @@ def main():
     p.set_defaults(func=cmd_fetch)
     p = sub.add_parser("list-missing", help="list RJs without on-disk subs")
     p.set_defaults(func=cmd_list_missing)
+    p = sub.add_parser("search-missing",
+                       help="search asmr.one for RJs missing local subs")
+    p.add_argument("rjs", nargs="*", help="optional subset of RJs to consider")
+    p.set_defaults(func=cmd_search_missing)
     p = sub.add_parser("fetch-missing",
                        help="fetch subs for all RJs missing on-disk subs")
     p.add_argument("rjs", nargs="*", help="optional subset of RJs to consider")

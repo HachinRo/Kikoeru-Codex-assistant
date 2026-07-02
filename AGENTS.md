@@ -5,9 +5,9 @@ Main web port:
 - Dashboard: http://127.0.0.1:8890/asmr-library
 
 Live stack:
-- <ASMR_STACK_ROOT>
-- <ASMR_MEDIA_ROOT>
-- <NEOKIKOERU_DB>
+- ASMR_STACK_ROOT: /Users/sainthenry/Documents/ASMR Pipeline/Web-UI
+- ASMR_MEDIA_ROOT: /Volumes/TOSHIBA/AMSR
+- NEOKIKOERU_DB: ~/Library/Application Support/neokikoeru/neokikoeru.db
 
 Pipeline source/reference repo:
 - refs/ASMR-Kikoeru -> https://github.com/HachinRo/Kikoeru-Codex-assistant

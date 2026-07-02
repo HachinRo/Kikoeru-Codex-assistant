@@ -286,10 +286,14 @@ def _classify(name: str) -> str:
     return "other"
 
 
-def _file_to_kikoeru(conn, row) -> dict:
+def _file_to_kikoeru(conn, row, duration_resolver=None) -> dict:
     """Convert a files table row into a kikoeru tree node."""
     is_folder = bool(row["is_folder"])
     name = row["name"]
+    if duration_resolver is None:
+        duration = float(row["duration"] or 0)
+    else:
+        duration = float(duration_resolver(row) or 0)
     node = {
         "title": name,
         "type": "folder" if is_folder else _classify(name),
@@ -297,6 +301,8 @@ def _file_to_kikoeru(conn, row) -> dict:
         "children": [],
         "mediaStreamUrl": None,
         "mediaDownloadUrl": None,
+        "size": int(row["size"] or 0),
+        "duration": duration,
         "lyrics": None,
     }
     if not is_folder:
@@ -305,7 +311,7 @@ def _file_to_kikoeru(conn, row) -> dict:
     return node
 
 
-def build_tree(conn, work_id: str) -> list:
+def build_tree(conn, work_id: str, duration_resolver=None) -> list:
     """Build the full kikoeru file tree for a work.
 
     The tree starts with the root folder as the first item, but kikoeru
@@ -337,7 +343,7 @@ def build_tree(conn, work_id: str) -> list:
         ).fetchall()
         rows = sorted(rows, key=natural_file_sort_key)
         for r in rows:
-            node = _file_to_kikoeru(conn, r)
+            node = _file_to_kikoeru(conn, r, duration_resolver=duration_resolver)
             if r["is_folder"]:
                 node["children"] = _children_of(r["id"])
             out.append(node)

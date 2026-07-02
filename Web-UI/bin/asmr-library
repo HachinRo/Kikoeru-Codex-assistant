@@ -1,13 +1,14 @@
 #!/bin/sh
 # Consolidated ASMR library command.
-# Safe library operations use the Hermes worker; ASMRoner utility operations are
-# run from the pinned state directory so config.toml resolves consistently.
+# Safe library operations use the ASMR worker; ASMRoner utility operations run
+# from the stack root so config.toml resolves consistently.
 
 set -eu
 umask 077
 
-HERMES_ROOT="${HERMES_HOME:-${HOME}/.hermes}"
-STATE_ROOT="${HERMES_ASMR_HOME:-${HERMES_ROOT}/asmr}"
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)"
+DEFAULT_STATE_ROOT="$(CDPATH= cd -- "${SCRIPT_DIR}/.." && pwd -P)"
+STATE_ROOT="${ASMR_STATE_ROOT:-${ASMR_STACK_ROOT:-${DEFAULT_STATE_ROOT}}}"
 WORKER_BIN="${ASMR_LIBRARY_WORKER_BIN:-${STATE_ROOT}/bin/asmr-library-worker}"
 ASMRONER_BIN="${ASMRONER_BIN:-${STATE_ROOT}/bin/asmroner}"
 
@@ -32,7 +33,7 @@ asmr-library dashboard                    # show integrated dashboard URL on por
   asmr-library fget <file_id> [out]     # download a file from Neokikoeru
   asmr-library works [page]             # list works via Neokikoeru API
   asmr-library work <RJ>                # get work metadata via Neokikoeru API
-  asmr-library subs <login|check|fetch|list-missing|fetch-missing> ...
+  asmr-library subs <login|check|fetch|list-missing|search-missing|fetch-missing> ...
                                        # fetch Chinese subtitles from asmr.one;
                                        # auto-discovers the sub-having sibling RJ
                                        # (簡体中文 > 繁体中文 > original) and matches
@@ -42,7 +43,7 @@ asmr-library dashboard                    # show integrated dashboard URL on por
 Safe library commands (download/status/retry) go through asmr-library-worker.
 serve runs Neokikoeru (the only viewer) against a symlink index of the library.
 listen has been removed: Neokikoeru replaces ASMRoner's listen path.
-ASMRoner utility commands run from ~/.hermes/asmr so its config is found.
+ASMRoner utility commands run from the ASMR stack root so its config is found.
 
 Neokikoeru's native file list is license-gated (only chobit.cc preview shows for
 unactivated installs). The files/fcat/fget/works/work/subcommands use the
@@ -186,7 +187,7 @@ PY
 }
 
 build_listen_index() {
-    source_root="${ASMR_LIBRARY_ROOT:-${HOME}/ASMR}"
+    source_root="${ASMR_LIBRARY_ROOT:-${ASMR_MEDIA_ROOT:-/Volumes/TOSHIBA/AMSR}}"
     index_root="${ASMR_LISTEN_INDEX_ROOT:-${STATE_ROOT}/listen-index}"
     metadata_file="${STATE_ROOT}/listen-index-metadata.json"
     rj_file="${STATE_ROOT}/listen-index-rjs.txt"
