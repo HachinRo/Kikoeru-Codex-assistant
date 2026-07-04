@@ -221,7 +221,23 @@ __marimo__/
 local/
 *.db
 *.db-*
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*
 *.bak*
+*.mp3
+*.m4a
+*.flac
+*.wav
+*.ogg
+*.opus
+*.mp4
+*.mkv
+*.webm
+*.vtt
+*.srt
+*.lrc
 .DS_Store
 node_modules/
 
@@ -235,6 +251,7 @@ memory-backup-*/
 hermes-asmr-copy/
 
 # Web-UI publish bundle local/runtime leftovers.
+Web-UI/
 Web-UI/-/
 Web-UI/-
 Web-UI/.asmr-one-cookies.txt

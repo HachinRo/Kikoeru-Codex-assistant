@@ -7,7 +7,9 @@ const { query, param, body } = require('express-validator');
 const db = require('../database/db');
 const { config } = require('../config');
 const { getTrackList } = require('../filesystem/utils');
-const { isValidRequest } = require('./utils/validate');
+const { isValidRequest, requireAdmin } = require('./utils/validate');
+const { joinFragments } = require('./utils/url');
+const { redactTranslateTask } = require('./utils/translate');
 const { formatID } = require('../filesystem/utils');
 const { AILyricTaskStatus } = require('../common.js');
 
@@ -45,6 +47,7 @@ router.get('/translate',
   query('file_name').optional({nullable: true}).isString(),
   query('status').isJSON(),
   async (req, res, next) => {
+    if(!requireAdmin(req, res)) return;
     if(!isValidRequest(req, res)) return;
 
     const page = parseInt(req.query.page);
@@ -61,6 +64,7 @@ router.get('/translate',
       const limitCount = (page == -1 && work_id > 0) ? totalCount : PAGE_SIZE; // 如果page为-1，且work_id有效，则直接返回这个作品的所有翻译任务
       // console.log("limitCount = ", limitCount);
       let tasks = await query().offset(offset).limit(limitCount).orderBy([{ column: 't_translate_task.updated_at', order: 'desc'}]);
+      tasks = tasks.map(redactTranslateTask);
 
       res.send({
         pagination: {
@@ -82,6 +86,7 @@ router.put('/translate/:id/:index',
   param('id').isInt(),
   param('index').isInt(),
   async (req, res, next) => {
+    if(!requireAdmin(req, res)) return;
     if(!isValidRequest(req, res)) return;
 
     const work_id = req.params.id;
@@ -118,7 +123,7 @@ router.put('/translate/:id/:index',
     try {
       const ids = await db.createTranslateTask(work_id, audioPath);
       res.send({ id: ids[0] })
-      const username = config.auth ? req.user.name : 'admin';
+      const username = req.user.name;
       db.markWorkAILyricStatus(work_id, username, true);
     } catch (err) {
       res.status(500).send({error: err.message});
@@ -131,11 +136,16 @@ router.put('/translate/:id/:index',
 router.delete('/translate/:id',
   param('id').isInt(),
   async function(req, res, next) {
+    if(!requireAdmin(req, res)) return;
     if(!isValidRequest(req, res)) return;
 
     const id = parseInt(req.params.id);
     try {
       const task = await db.knex('t_translate_task').select('work_id').where('id', '=', id).first();
+      if (!task) {
+        res.status(404).send({error: "没有找到指定的任务"});
+        return;
+      }
       const work_id = task.work_id;
 
       // delete
@@ -152,7 +162,7 @@ router.delete('/translate/:id',
             .where('work_id', '=', work_id)
             .first();
       if (!remainTask) {
-        const username = config.auth ? req.user.name : 'admin';
+        const username = req.user.name;
         await db.markWorkAILyricStatus(work_id, username, false);
         console.log(`work[${work_id}] has no translate task no, clear its ai lyric status`);
       }
@@ -173,7 +183,7 @@ router.get('/translate/get',
     const secret = req.query.secret;
     try {
       const task = await db.knex('t_translate_task')
-        .select("id", "worker_status", "work_id", "audio_path")
+        .select("id", "worker_status", "work_id")
         .where('id', '=', id)
         .where('secret', '=', secret)
         .first();
@@ -189,6 +199,7 @@ router.get('/translate/get',
 router.post('/translate/redo/:id',
   param('id').isInt(),
   async function(req, res, next) {
+    if(!requireAdmin(req, res)) return;
     if(!isValidRequest(req, res)) return;
 
     const id = parseInt(req.params.id);
@@ -210,6 +221,7 @@ router.post('/translate/redo/:id',
 router.post('/translate/acquire', 
   body('worker_name').isString(),
   async function(req, res, next) {
+    if(!requireAdmin(req, res)) return;
     if(!isValidRequest(req, res)) return;
     const worker_name = req.body.worker_name;
     // console.log('translation worker try acquire task:', worker_name)
@@ -287,6 +299,7 @@ router.get('/translate/download',
   query('id').isInt(),
   query('secret').isString(),
   async function(req, res, next) {
+    if(!isValidRequest(req, res)) return;
     const task_id = req.query.id;
     const secret = req.query.secret;
 
@@ -297,8 +310,12 @@ router.get('/translate/download',
         .where('t_translate_task.id', '=', task_id)
         .where('t_translate_task.secret', '=', secret)
         .first();
-    
-        const rootFolder = config.rootFolders.find(rootFolder => rootFolder.name === task.root_folder);
+
+      if (!task) {
+        res.status(404).send({error: '没有找到指定的任务'});
+        return;
+      }
+      const rootFolder = config.rootFolders.find(rootFolder => rootFolder.name === task.root_folder);
 
       if (rootFolder) {
         // Offload from express, 302 redirect to a virtual directory in a reverse proxy like Nginx
@@ -320,7 +337,7 @@ router.get('/translate/download',
           res.download(path.join(rootFolder.path, task.dir, task.audio_path));
         }
       } else {
-        res.status(500).send({error: `找不到文件夹: "${work.root_folder}"，请尝试重启服务器或重新扫描.`});
+        res.status(500).send({error: `找不到文件夹: "${task.root_folder}"，请尝试重启服务器或重新扫描.`});
       }
     } catch (err) {
       res.status(404).send({error: `下载翻译音频文件失败 ${err.message}`});
@@ -386,6 +403,7 @@ router.get('/translate/lrc',
   query('id').isInt({min: 0}),
   async (req, res, next) => {
     console.log("translate get lrc called")
+    if(!requireAdmin(req, res)) return;
     if(!isValidRequest(req, res)) return;
 
     const id = req.query.id;

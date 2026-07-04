@@ -11,8 +11,23 @@ const compareVersions = require('compare-versions');
 const versionWithoutVerTracking = '0.4.1';
 // Before the following version, db path is using the absolute path in databaseFolderDir of config.json
 const versionDbRelativePath = '0.5.8';
+const isTestEnv = process.env.NODE_ENV === 'test';
+const allowUnauthenticated = process.env.KIKOERU_ALLOW_UNAUTHENTICATED === '1';
+const allowRemoteConnection = process.env.KIKOERU_ALLOW_REMOTE === '1';
+const shouldForceAuth = () => !isTestEnv && !allowUnauthenticated;
+const shouldForceLocalOnly = () => !isTestEnv && !allowRemoteConnection;
 
 let config = {};
+
+const enforceRuntimeSecurityDefaults = (cfg) => {
+  if (shouldForceAuth()) {
+    cfg.auth = true;
+  }
+  if (shouldForceLocalOnly()) {
+    cfg.blockRemoteConnection = true;
+  }
+  return cfg;
+}
 
 const voiceWorkDefaultPath = () => {
   if (process.env.IS_DOCKER) {
@@ -43,7 +58,7 @@ const defaultConfig = {
   coverUseDefaultPath: false, // Ignores coverFolderDir if set to true
   dbUseDefaultPath: true, // Ignores databaseFolderDir if set to true
   voiceWorkDefaultPath: voiceWorkDefaultPath(),
-  auth: process.env.NODE_ENV === 'production' ? true : false,
+  auth: shouldForceAuth(),
   md5secret: crypto.randomBytes(32).toString('hex'),
   jwtsecret: crypto.randomBytes(32).toString('hex'),
   expiresIn: 2592000,
@@ -57,7 +72,7 @@ const defaultConfig = {
   httpProxyHost: '',
   httpProxyPort: 0,
   listenPort: 8888,
-  blockRemoteConnection: false,
+  blockRemoteConnection: shouldForceLocalOnly(),
   behindProxy: false,
   httpsEnabled: false,
   httpsPrivateKey: 'kikoeru.key',
@@ -83,14 +98,17 @@ const initConfig = (writeConfigToFile = !process.env.FREEZE_CONFIG_FILE) => {
 const setConfig = (newConfig, writeConfigToFile = !process.env.FREEZE_CONFIG_FILE) => {
   // Prevent changing some values, overwrite with old ones
   newConfig.production = config.production;
-  if (process.env.NODE_ENV === 'production' || config.production) {
+  if (process.env.NODE_ENV === 'production' || config.production || shouldForceAuth()) {
     newConfig.auth = true;
+  }
+  if (shouldForceLocalOnly()) {
+    newConfig.blockRemoteConnection = true;
   }
   newConfig.md5secret = config.md5secret;
   newConfig.jwtsecret = config.jwtsecret;
 
   // Merge config
-  config = Object.assign(config, newConfig);
+  config = enforceRuntimeSecurityDefaults(Object.assign(config, newConfig));
   if (writeConfigToFile) {
     fs.writeFileSync(configPath, JSON.stringify(config, null, "\t"));
   }
@@ -132,6 +150,7 @@ const readConfig = () => {
     config.auth = true;
     config.production = true;
   }
+  enforceRuntimeSecurityDefaults(config);
 };
 
 // Migrate config

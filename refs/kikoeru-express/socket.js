@@ -4,6 +4,10 @@ const jwtAuth = require('socketio-jwt-auth'); // 用于 JWT 验证的 socket.io 
 const child_process = require('child_process'); // 子进程
 const { config } = require('./config');
 
+const isAdminSocket = (socket) => {
+  return Boolean(socket.request && socket.request.user && socket.request.user.name === 'admin');
+}
+
 const initSocket = (server) => {
   const io = socket(server);
   if (config.auth) {
@@ -27,6 +31,11 @@ const initSocket = (server) => {
 
   // 有新的客户端连接时触发
   io.on('connection', function (socket) {
+    if (!isAdminSocket(socket)) {
+      socket.emit('error', { message: '只有 admin 账号能登录管理后台.' });
+      socket.disconnect(true);
+      return;
+    }
     // console.log('connection');
     socket.emit('success', {
       message: '成功登录管理后台.',
