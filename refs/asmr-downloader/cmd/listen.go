@@ -6,9 +6,14 @@ import (
 	"asmroner/internal/model"
 	"asmroner/webui"
 	"context"
+	"crypto/rand"
+	"crypto/subtle"
+	"encoding/hex"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -26,6 +31,10 @@ import (
 )
 
 var listenPort int
+var listenHost string
+var listenToken string
+
+const listenTokenCookie = "asmroner_listen_token"
 
 // listen 命令
 // 监听命令
@@ -84,12 +93,24 @@ listen 命令用于启动一个 Web UI 服务器，用于展示和播放下载�
 		if port == 0 {
 			port = 9999
 		}
-		logger.Step("启动 Web UI，端口: %d，数据目录: %s", port, absDataFolder)
+		host := strings.TrimSpace(listenHost)
+		if host == "" {
+			host = "127.0.0.1"
+		}
+		token := strings.TrimSpace(listenToken)
+		if token == "" {
+			token, err = generateListenToken()
+			if err != nil {
+				logger.Fail("生成访问令牌失败: %v", err)
+				return
+			}
+		}
+		logger.Step("启动 Web UI，监听: %s，数据目录: %s", net.JoinHostPort(host, strconv.Itoa(port)), absDataFolder)
 
 		// Gin Release 模式
 		gin.SetMode(gin.ReleaseMode)
 		r := gin.New()
-		r.Use(gin.Logger(), gin.Recovery())
+		r.Use(gin.Recovery(), listenAuthMiddleware(token))
 
 		fs := webui.GetFileSystem()
 		r.StaticFS("/public", fs)
@@ -105,7 +126,7 @@ listen 命令用于启动一个 Web UI 服务器，用于展示和播放下载�
 		})
 
 		// 静态文件服务
-		r.StaticFS(fmt.Sprintf("/%s", folderName), gin.Dir(absDataFolder, true))
+		r.StaticFS(fmt.Sprintf("/%s", folderName), gin.Dir(absDataFolder, false))
 
 		// API: 获取文件列表
 		r.GET("/api/list", func(c *gin.Context) {
@@ -125,7 +146,7 @@ listen 命令用于启动一个 Web UI 服务器，用于展示和播放下载�
 			}))
 		})
 
-		addr := fmt.Sprintf(":%d", port)
+		addr := net.JoinHostPort(host, strconv.Itoa(port))
 		srv := &http.Server{
 			Addr:              addr,
 			Handler:           r,
@@ -145,7 +166,11 @@ listen 命令用于启动一个 Web UI 服务器，用于展示和播放下载�
 		// 延迟打开浏览器
 		go func() {
 			time.Sleep(500 * time.Millisecond) // 确保端口监听成功
-			link := fmt.Sprintf("http://localhost:%d", port)
+			browserHost := host
+			if browserHost == "0.0.0.0" || browserHost == "::" {
+				browserHost = "127.0.0.1"
+			}
+			link := fmt.Sprintf("http://%s/?token=%s", net.JoinHostPort(browserHost, strconv.Itoa(port)), url.QueryEscape(token))
 			browser.OpenURL(link)
 		}()
 
@@ -169,6 +194,37 @@ listen 命令用于启动一个 Web UI 服务器，用于展示和播放下载�
 func init() {
 	rootCmd.AddCommand(listenCmd)
 	listenCmd.Flags().IntVarP(&listenPort, "port", "p", 9999, "服务器端口")
+	listenCmd.Flags().StringVar(&listenHost, "host", "127.0.0.1", "服务器监听地址")
+	listenCmd.Flags().StringVar(&listenToken, "token", "", "Web UI 访问令牌，留空时自动生成")
+}
+
+func generateListenToken() (string, error) {
+	buf := make([]byte, 32)
+	if _, err := rand.Read(buf); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(buf), nil
+}
+
+func listenAuthMiddleware(token string) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		candidate := c.GetHeader("X-ASMRONER-LISTEN-TOKEN")
+		if candidate == "" {
+			candidate = c.Query("token")
+		}
+		if candidate == "" {
+			cookie, err := c.Cookie(listenTokenCookie)
+			if err == nil {
+				candidate = cookie
+			}
+		}
+		if subtle.ConstantTimeCompare([]byte(candidate), []byte(token)) != 1 {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
+			return
+		}
+		c.SetCookie(listenTokenCookie, token, 0, "/", "", false, true)
+		c.Next()
+	}
 }
 
 // FolderInfo 用于 /api/list 的 JSON 输出
