@@ -2447,7 +2447,6 @@ class AsmrViewHandler(BaseHTTPRequestHandler):
     def _admin_reindex(self):
         """Trigger metadata/cover reindex only, then refresh our cache."""
         cmd = [str(STATE_ROOT / "bin" / "asmr-library"), "reindex"]
-        poll_cmd = [str(STATE_ROOT / "bin" / "asmr-library"), "serve", "tasks"]
         try:
             proc = subprocess.run(
                 cmd,
@@ -2455,37 +2454,13 @@ class AsmrViewHandler(BaseHTTPRequestHandler):
                 text=True,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
-                timeout=120,
+                timeout=900,
                 env={
                     **os.environ,
                     "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
                 },
             )
-            task_output = ""
-            if proc.returncode == 0:
-                # NeoKikoeru's DLsite metadata scan is async. Wait briefly so
-                # cover fields are populated before rebuilding /api/covers.
-                deadline = time.monotonic() + 240
-                while True:
-                    task_proc = subprocess.run(
-                        poll_cmd,
-                        cwd=str(STATE_ROOT),
-                        text=True,
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.STDOUT,
-                        timeout=30,
-                        env={
-                            **os.environ,
-                            "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
-                        },
-                    )
-                    task_output = task_proc.stdout[-8000:]
-                    lowered = task_output.lower()
-                    if "running" not in lowered and "pending" not in lowered and "queued" not in lowered:
-                        break
-                    if time.monotonic() >= deadline:
-                        break
-                    time.sleep(3)
+            task_output = proc.stdout[-8000:]
             results = {
                 "command": cmd,
                 "exit_code": proc.returncode,

@@ -386,7 +386,7 @@ cmd_login() {
     fi
     token="$(printf '%s' "${body_only}" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("token",""))' 2>/dev/null || true)"
     [ -n "${token}" ] || fail "no token in response: ${body_only}"
-    expires_at="$(python3 -c "import datetime; print((datetime.datetime.utcnow() + datetime.timedelta(days=6, hours=23)).strftime('%Y-%m-%dT%H:%M:%SZ'))")"
+    expires_at="$(python3 -c "import datetime; print((datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=6, hours=23)).strftime('%Y-%m-%dT%H:%M:%SZ'))")"
     port="$(read_cfg port 2>/dev/null || echo "${DEFAULT_PORT}")"
     write_cfg \
         "port=${port}" \
@@ -395,6 +395,47 @@ cmd_login() {
         "token=${token}" \
         "token_expires_at=${expires_at}"
     say "Login OK; JWT stored in ${CONFIG_FILE} (valid through ${expires_at})"
+}
+
+token_is_current() {
+    python3 - "${CONFIG_FILE}" <<'PY'
+import datetime
+import json
+import sys
+
+try:
+    with open(sys.argv[1], encoding="utf-8") as f:
+        cfg = json.load(f)
+except Exception:
+    sys.exit(1)
+
+if not str(cfg.get("token") or "").strip():
+    sys.exit(1)
+
+expires_at = str(cfg.get("token_expires_at") or "").strip()
+if not expires_at:
+    sys.exit(1)
+
+try:
+    if expires_at.endswith("Z"):
+        expires_at = expires_at[:-1] + "+00:00"
+    expiry = datetime.datetime.fromisoformat(expires_at)
+    if expiry.tzinfo is None:
+        expiry = expiry.replace(tzinfo=datetime.timezone.utc)
+except Exception:
+    sys.exit(1)
+
+if expiry <= datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(minutes=5):
+    sys.exit(1)
+PY
+}
+
+ensure_token() {
+    if token_is_current; then
+        return 0
+    fi
+    say "Refreshing NeoKikoeru JWT..."
+    cmd_login
 }
 
 cmd_storage_add() {
@@ -406,6 +447,7 @@ cmd_storage_add() {
         esac
     done
     [ -d "${path}" ] || fail "storage path is not a directory: ${path}"
+    ensure_token
     token="$(read_cfg token 2>/dev/null || true)"
     [ -n "${token}" ] || fail "no JWT — run: asmr-library serve login first"
     body="$(python3 -c "import json,sys; print(json.dumps({'driver':'local','driver_meta':{'root_folder_path':sys.argv[1]},'max_scan_depth':3,'ignore_folders':[],'force_proxy':False,'remark':'asmr-library'}))" "${path}")"
@@ -423,6 +465,7 @@ cmd_storage_add() {
 }
 
 cmd_storage_list() {
+    ensure_token
     token="$(read_cfg token 2>/dev/null || true)"
     [ -n "${token}" ] || fail "no JWT — run: asmr-library serve login first"
     out="$(api_get '/admin/storages?page=1&page_size=100' "${token}")"
@@ -439,6 +482,7 @@ cmd_storage_list() {
 # `asmr-library serve storage scan [ID]` -- ID defaults to 1.
 cmd_storage_scan() {
     id="${1:-1}"
+    ensure_token
     token="$(read_cfg token 2>/dev/null || true)"
     [ -n "${token}" ] || fail "no JWT — run: asmr-library serve login first"
     out="$(api_post "/admin/storage/${id}/scan" '{}' "${token}")"
@@ -459,6 +503,7 @@ cmd_storage_scan() {
 # `asmr-library serve storage index [ID]`
 cmd_storage_index() {
     id="${1:-1}"
+    ensure_token
     token="$(read_cfg token 2>/dev/null || true)"
     [ -n "${token}" ] || fail "no JWT — run: asmr-library serve login first"
     out="$(api_post "/admin/storage/${id}/index" '{}' "${token}")"
@@ -477,6 +522,7 @@ cmd_storage_index() {
 # Poll admin tasks.  `asmr-library serve tasks [STATUS]`
 # STATUS filters by name/state: running, done, failed, all
 cmd_tasks() {
+    ensure_token
     token="$(read_cfg token 2>/dev/null || true)"
     [ -n "${token}" ] || fail "no JWT — run: asmr-library serve login first"
     out="$(api_get '/admin/tasks?page=1&page_size=20' "${token}")"
@@ -496,12 +542,16 @@ elif isinstance(d, list):
     tasks = d
 else:
     tasks = []
-state_name = {1: 'running', 2: 'done', 3: 'failed', 4: 'cancelled'}
+state_name = {1: 'queued', 2: 'running', 3: 'cancelled', 4: 'done', 5: 'failed'}
 for t in tasks:
     sn = state_name.get(t.get('state', 0), '?')
     name = t.get('name', '?')[:50]
-    prog = int(t.get('progress', 0) or 0)
-    stat = t.get('status', '')[:30]
+    try:
+        raw_prog = float(t.get('progress', 0) or 0)
+    except (TypeError, ValueError):
+        raw_prog = 0
+    prog = int(round(raw_prog * 100 if raw_prog <= 1 else raw_prog))
+    stat = t.get('status', '')[:45]
     err = t.get('error', '')[:40]
     print(f'  [{t.get(\"id\",\"\")[:8]:8s}] {sn:9s} {prog:3d}%  {name:50s}  {stat}  {err}')
 " 2>&1
