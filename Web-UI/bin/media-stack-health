@@ -1,0 +1,144 @@
+#!/bin/sh
+# Read-only health report for the local ASMR stack.
+set -eu
+
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)"
+STATE_ROOT="${ASMR_STATE_ROOT:-${ASMR_STACK_ROOT:-$(CDPATH= cd -- "${SCRIPT_DIR}/.." && pwd -P)}}"
+VIEW_BIN="${STATE_ROOT}/bin/asmr-view"
+LIB_BIN="${STATE_ROOT}/bin/asmr-library"
+LIBRARY_ROOT="${ASMR_LIBRARY_ROOT:-${ASMR_MEDIA_ROOT:-/Volumes/TOSHIBA/AMSR}}"
+DB="${NEOKIKOERU_DB:-${HOME}/Library/Application Support/neokikoeru/neokikoeru.db}"
+VIEW_URL="${ASMR_VIEW_URL:-http://127.0.0.1:8890}"
+
+ok=1
+
+section() {
+    printf '\n== %s ==\n' "$1"
+}
+
+check_cmd() {
+    label="$1"
+    shift
+    if "$@"; then
+        return 0
+    fi
+    printf 'WARN: %s failed\n' "${label}" >&2
+    ok=0
+    return 0
+}
+
+section "Processes"
+if [ -x "${VIEW_BIN}" ]; then
+    check_cmd "asmr-view status" "${VIEW_BIN}" status
+else
+    printf 'MISSING: %s\n' "${VIEW_BIN}"
+    ok=0
+fi
+
+if command -v lsof >/dev/null 2>&1; then
+    lsof -nP -iTCP:8889 -iTCP:8890 -iTCP:8891 -sTCP:LISTEN || true
+else
+    printf 'WARN: lsof is not installed\n'
+fi
+
+section "HTTP"
+python3 - "${VIEW_URL}" <<'PY' || ok=0
+import json
+import sys
+import urllib.error
+import urllib.request
+
+base = sys.argv[1].rstrip("/")
+checks = [
+    ("viewer health", "/api/health"),
+    ("dashboard health", "/api/asmr-library/health"),
+    ("library summary", "/api/asmr-library/library/summary"),
+]
+
+for label, path in checks:
+    url = base + path
+    try:
+        with urllib.request.urlopen(url, timeout=8) as resp:
+            body = resp.read()
+            status = resp.status
+        try:
+            payload = json.loads(body.decode("utf-8"))
+        except Exception:
+            payload = {}
+        if status >= 400:
+            raise RuntimeError(f"HTTP {status}")
+        if label == "viewer health":
+            print(f"{label}: OK works={payload.get('works')} covers={payload.get('covers')}")
+        elif label == "library summary":
+            print(
+                f"{label}: OK library_works={payload.get('library_works')} "
+                f"db_works={payload.get('db_works')} audio={payload.get('audio_files')} "
+                f"subs={payload.get('subtitle_files')} missing_subs={payload.get('missing_subtitle_count')}"
+            )
+        else:
+            print(f"{label}: OK")
+    except Exception as e:
+        print(f"{label}: FAIL {e}", file=sys.stderr)
+        sys.exit(1)
+PY
+
+section "Storage"
+if [ -d "${LIBRARY_ROOT}" ]; then
+    python3 - "${LIBRARY_ROOT}" <<'PY' || ok=0
+from pathlib import Path
+import re
+import sys
+
+root = Path(sys.argv[1])
+rjs = [p for p in root.iterdir() if p.is_dir() and re.fullmatch(r"RJ\d+", p.name, re.I)]
+print(f"library root: OK {root}")
+print(f"RJ folders: {len(rjs)}")
+PY
+else
+    printf 'library root: FAIL missing %s\n' "${LIBRARY_ROOT}" >&2
+    ok=0
+fi
+
+section "NeoKikoeru DB"
+if [ -f "${DB}" ]; then
+    python3 - "${DB}" "${LIBRARY_ROOT}" <<'PY' || ok=0
+from pathlib import Path
+import sqlite3
+import sys
+
+db_path = Path(sys.argv[1])
+root = Path(sys.argv[2])
+conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+conn.row_factory = sqlite3.Row
+works = conn.execute("SELECT COUNT(*) FROM works").fetchone()[0]
+files = conn.execute("SELECT COUNT(*) FROM files WHERE COALESCE(is_folder,0)=0").fetchone()[0]
+missing = 0
+for row in conn.execute("SELECT path, is_folder FROM files"):
+    path = str(row["path"] or "")
+    real = root / path.lstrip("/") if path.startswith("/") else root / path
+    if bool(row["is_folder"]):
+        exists = real.is_dir()
+    else:
+        exists = real.is_file()
+    if not exists:
+        missing += 1
+conn.close()
+print(f"db: OK {db_path}")
+print(f"works={works} file_rows={files} missing_paths={missing}")
+if missing:
+    sys.exit(1)
+PY
+else
+    printf 'db: FAIL missing %s\n' "${DB}" >&2
+    ok=0
+fi
+
+section "Subtitles"
+if [ -x "${LIB_BIN}" ]; then
+    check_cmd "subtitle missing list" "${LIB_BIN}" subs list-missing
+else
+    printf 'MISSING: %s\n' "${LIB_BIN}"
+    ok=0
+fi
+
+[ "${ok}" -eq 1 ]
