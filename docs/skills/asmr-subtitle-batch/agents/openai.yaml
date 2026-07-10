@@ -1,0 +1,4 @@
+interface:
+  display_name: "ASMR Subtitle Batch"
+  short_description: "Fast MacWhisper-to-Chinese VTT workflow."
+  default_prompt: "Use $asmr-subtitle-batch to generate Chinese VTT sidecars for this ASMR work."

@@ -6,7 +6,7 @@ Use this file when diagnosing ASMR-library/Kikoeru/NeoKikoeru failures, routing 
 
 | Component | Location / URL | Notes |
 | --- | --- | --- |
-| Main viewer | `http://127.0.0.1:8890` | Kikoeru-compatible frontend and API served by `asmr-view`. This is the only normal browser/operator port. |
+| Main viewer | `http://127.0.0.1:8890` | Kikoeru-compatible frontend and API served by `asmr-view`. It intentionally binds to the trusted LAN; maintenance mutations require admin credentials. |
 | Integrated dashboard | `http://127.0.0.1:8890/asmr-library` | Namespaced ASMR-library UI inside the main viewer. |
 | Standalone dashboard | retired | Do not use a separate `8891` dashboard; use `/asmr-library` on `8890`. |
 | NeoKikoeru maintenance | on-demand internal service | May be started temporarily by build/reindex, but should not be left as a persistent browser/admin port. |
@@ -25,7 +25,7 @@ Use this file when diagnosing ASMR-library/Kikoeru/NeoKikoeru failures, routing 
 - `<ASMR_STACK_ROOT>/bin/asmr-neo`: work/file lookup CLI now expected to use viewer API/stream routes on `8890`.
 - `<ASMR_STACK_ROOT>/bin/neokikoeru-serve`: NeoKikoeru adapter; previously had a float progress formatting crash in tasks output.
 - `<ASMR_STACK_ROOT>/lib/asmr_view_kikoeru.py`: Kikoeru-compatible routes, media streaming, search, grouping.
-- `<ASMR_STACK_ROOT>/kikoeru-spa/js/app.051b603f.fix2.js`: patched SPA bundle.
+- `<ASMR_STACK_ROOT>/kikoeru-spa/js/app.051b603f.fix10.js`: active patched SPA bundle.
 - `<ASMR_STACK_ROOT>/kikoeru-spa/index.html`: points the frontend to the patched bundle.
 
 ## Expected API surface
@@ -99,15 +99,15 @@ Previously refetched/fixed RJ examples:
 Use these after code changes:
 
 ```bash
-rtk ./bin/media-stack-health
-rtk "<ASMR_STACK_ROOT>/bin/asmr-view" status
-rtk curl -fsS "http://127.0.0.1:8890/asmr-library"
-rtk curl -fsS "http://127.0.0.1:8890/api/search/RJ01571688?count=20&page=1"
-rtk curl -fsS "http://127.0.0.1:8890/api/tags/500/works"
-rtk curl -fsS "http://127.0.0.1:8890/api/circles/RG74824/works"
-rtk curl -fsS "http://127.0.0.1:8890/api/vas/eRGTnmW8/works"
-rtk curl -fsS "http://127.0.0.1:8890/api/duration/ylelmK2e_kI"
-rtk curl -fsS -I "http://127.0.0.1:8890/api/media/stream/ylelmK2e_kI?token="
+"<ASMR_STACK_ROOT>/bin/media-stack-health"
+"<ASMR_STACK_ROOT>/bin/asmr-view" status
+curl -fsS "http://127.0.0.1:8890/asmr-library"
+curl -fsS "http://127.0.0.1:8890/api/search/RJ01571688?count=20&page=1"
+curl -fsS "http://127.0.0.1:8890/api/tags/500/works"
+curl -fsS "http://127.0.0.1:8890/api/circles/RG74824/works"
+curl -fsS "http://127.0.0.1:8890/api/vas/eRGTnmW8/works"
+curl -fsS "http://127.0.0.1:8890/api/duration/ylelmK2e_kI"
+curl -fsS -I "http://127.0.0.1:8890/api/media/stream/ylelmK2e_kI?token="
 ```
 
 ## Reference repos

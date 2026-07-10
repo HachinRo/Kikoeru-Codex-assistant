@@ -250,8 +250,38 @@ memory/
 memory-backup-*/
 hermes-asmr-copy/
 
-# Web-UI publish bundle local/runtime leftovers.
-Web-UI/
+# Web-UI contains tracked sanitized source plus ignored live state. Keep the
+# allow-list narrow so cookies, databases, logs, media indexes, and binaries
+# can never be added accidentally.
+Web-UI/*
+!Web-UI/bin/
+Web-UI/bin/*
+!Web-UI/bin/asmr-*
+!Web-UI/bin/media-stack-health
+!Web-UI/bin/neokikoeru-fetch
+!Web-UI/bin/neokikoeru-serve
+!Web-UI/bin/checksums.sha256
+!Web-UI/lib/
+Web-UI/lib/*
+!Web-UI/lib/*.py
+!Web-UI/kikoeru-spa/
+Web-UI/kikoeru-spa/*
+!Web-UI/kikoeru-spa/index.html
+!Web-UI/kikoeru-spa/css/
+Web-UI/kikoeru-spa/css/*
+!Web-UI/kikoeru-spa/css/app.88bd61a4.css
+!Web-UI/kikoeru-spa/fonts/
+!Web-UI/kikoeru-spa/statics/
+!Web-UI/kikoeru-spa/js/
+Web-UI/kikoeru-spa/js/*
+!Web-UI/kikoeru-spa/js/3.a7cffda9.js
+!Web-UI/kikoeru-spa/js/runtime.3597b51d.js
+!Web-UI/kikoeru-spa/js/vendor.86022408.js
+!Web-UI/kikoeru-spa/js/app.051b603f.fix10.js
+!Web-UI/kikoeru-spa/js/asmr-*.js
+!Web-UI/view/
+Web-UI/view/*
+!Web-UI/view/index.html
 Web-UI/-/
 Web-UI/-
 Web-UI/.asmr-one-cookies.txt

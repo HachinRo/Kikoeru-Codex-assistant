@@ -1,0 +1,71 @@
+#!/bin/sh
+# Dashboard workflow for repairing missing or stale ASMR covers.
+set -eu
+
+HOME_DIR="${HOME}"
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)"
+LIB_BIN="${ASMR_LIBRARY_BIN:-${SCRIPT_DIR}/asmr-library}"
+VIEW_URL="${ASMR_VIEW_URL:-http://127.0.0.1:8890}"
+DB="${NEOKIKOERU_DB:-${HOME_DIR}/Library/Application Support/neokikoeru/neokikoeru.db}"
+COVER_ROOT="${NEOKIKOERU_COVER_ROOT:-${HOME_DIR}/Library/Application Support/neokikoeru}"
+CHECK_RJ="${1:-RJ01580504}"
+
+count_covers() {
+  python3 - "$DB" "$COVER_ROOT" <<'PY'
+import sqlite3
+import sys
+from pathlib import Path
+
+db_path = Path(sys.argv[1])
+cover_root = Path(sys.argv[2])
+conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+conn.row_factory = sqlite3.Row
+rows = conn.execute("SELECT id, image_main, image_thumb FROM works").fetchall()
+conn.close()
+
+blank = []
+broken = []
+for row in rows:
+    main = row["image_main"] or ""
+    thumb = row["image_thumb"] or ""
+    if not main or not thumb:
+        blank.append(row["id"])
+        continue
+    candidates = [
+        cover_root / "covers" / main,
+        cover_root / main,
+        cover_root / "covers" / thumb,
+        cover_root / thumb,
+    ]
+    if not any(p.is_file() for p in candidates[:2]) or not any(p.is_file() for p in candidates[2:]):
+        broken.append(row["id"])
+
+print(f"works={len(rows)} blank_cover_fields={len(blank)} broken_cover_files={len(broken)}")
+if blank:
+    print("blank:", " ".join(blank[:20]))
+if broken:
+    print("broken:", " ".join(broken[:20]))
+PY
+}
+
+echo "Fix missing cover workflow"
+echo "1. Inspect NeoKikoeru cover metadata/files"
+count_covers
+
+echo
+echo "2. Run the local authenticated-equivalent metadata refresh"
+[ -x "${LIB_BIN}" ] || {
+  echo "missing asmr-library executable: ${LIB_BIN}" >&2
+  exit 1
+}
+"${LIB_BIN}" reindex
+
+echo
+echo "3. Re-check cover metadata/files"
+count_covers
+
+echo
+echo "4. Verify viewer health and sample cover endpoint (${CHECK_RJ})"
+curl -fsS "${VIEW_URL}/api/health"
+echo
+curl -fsSI "${VIEW_URL}/api/cover/${CHECK_RJ}?token=&v=${CHECK_RJ}" | sed -n '1,8p'

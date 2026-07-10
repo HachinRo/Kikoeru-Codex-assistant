@@ -1,0 +1,69 @@
+#!/bin/sh
+# Install a checksum-pinned Neokikoeru release. Override the version only when
+# supplying the matching binary SHA-256 through NEOKIKOERU_SHA256.
+set -eu
+umask 077
+
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)"
+DEFAULT_STATE_ROOT="$(CDPATH= cd -- "${SCRIPT_DIR}/.." && pwd -P)"
+STATE_ROOT="${ASMR_STATE_ROOT:-${ASMR_STACK_ROOT:-${DEFAULT_STATE_ROOT}}}"
+BIN_DIR="${STATE_ROOT}/bin"
+VERSION_FILE="${STATE_ROOT}/neokikoeru.version"
+REPO="vscodev/neokikoeru"
+PINNED_TAG="${NEOKIKOERU_VERSION:-v3.7.1}"
+
+case "$(uname -s):$(uname -m)" in
+    Darwin:arm64|Darwin:aarch64) os_part="macos"; arch_part="arm64" ;;
+    Darwin:x86_64|Darwin:amd64)  os_part="macos"; arch_part="amd64" ;;
+    Linux:arm64|Linux:aarch64)   os_part="linux"; arch_part="arm64" ;;
+    Linux:x86_64|Linux:amd64)    os_part="linux"; arch_part="amd64" ;;
+    *) echo "Unsupported platform: $(uname -s)/$(uname -m)" >&2; exit 1 ;;
+esac
+
+expected_sha="${NEOKIKOERU_SHA256:-}"
+if [ "${PINNED_TAG}:${os_part}:${arch_part}" = "v3.7.1:macos:arm64" ]; then
+    expected_sha="${expected_sha:-4eb4f3ae6931c7510f9271ef22e3b10d7854f0d6ed4ebe5eb4dc9ec54d7719da}"
+fi
+[ -n "${expected_sha}" ] || {
+    echo "No trusted SHA-256 for ${PINNED_TAG} ${os_part}/${arch_part}; set NEOKIKOERU_SHA256" >&2
+    exit 1
+}
+
+asset="neokikoeru-${os_part}-${arch_part}.tar.gz"
+target="${BIN_DIR}/neokikoeru"
+mkdir -p "${BIN_DIR}"
+
+binary_sha() {
+    shasum -a 256 "$1" | awk '{print $1}'
+}
+
+if [ -x "${target}" ] && [ "$(cat "${VERSION_FILE}" 2>/dev/null || true)" = "${PINNED_TAG}" ]; then
+    actual_sha="$(binary_sha "${target}")"
+    if [ "${actual_sha}" = "${expected_sha}" ]; then
+        echo "Neokikoeru ${PINNED_TAG} verified at ${target}"
+        exit 0
+    fi
+    echo "Installed Neokikoeru checksum mismatch; replacing it from the pinned release" >&2
+fi
+
+tmp_tar="$(mktemp -t neokikoeru-tar.XXXXXX)"
+tmp_dir="$(mktemp -d -t neokikoeru-extract.XXXXXX)"
+trap 'rm -rf -- "${tmp_tar}" "${tmp_dir}"' EXIT
+download_url="https://github.com/${REPO}/releases/download/${PINNED_TAG}/${asset}"
+echo "Downloading ${download_url}"
+curl -fsSL "${download_url}" -o "${tmp_tar}"
+tar -xzf "${tmp_tar}" -C "${tmp_dir}"
+[ -f "${tmp_dir}/neokikoeru" ] || {
+    echo "Release archive did not contain neokikoeru" >&2
+    exit 1
+}
+
+actual_sha="$(binary_sha "${tmp_dir}/neokikoeru")"
+[ "${actual_sha}" = "${expected_sha}" ] || {
+    echo "Checksum mismatch for ${asset}: expected ${expected_sha}, got ${actual_sha}" >&2
+    exit 1
+}
+
+install -m 0755 "${tmp_dir}/neokikoeru" "${target}"
+printf '%s\n' "${PINNED_TAG}" > "${VERSION_FILE}"
+echo "Installed and verified Neokikoeru ${PINNED_TAG} -> ${target}"

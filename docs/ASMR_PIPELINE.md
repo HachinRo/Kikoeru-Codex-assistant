@@ -1,7 +1,7 @@
 # ASMR pipeline: current implementation
 
 This document describes the code that is actually installed and running as of
-2026-06-23. It deliberately favors live code and database evidence over older
+2026-07-11. It deliberately favors live code and database evidence over older
 Hermes notes where they disagree.
 
 ## Data flow
@@ -40,6 +40,11 @@ The TOSHIBA library is canonical. ASMRoner's metadata database, NeoKikoeru's
 SQLite database, and the compiled Kikoeru frontend are derived state.
 
 ## Source and reference repos
+
+Sanitized live source and the required SPA publish assets are tracked in this
+repository under `Web-UI/`. Runtime databases, cookies, logs, media indexes,
+downloaded binaries, and media remain ignored. Run `scripts/validate-source.sh`
+before committing.
 
 The user-maintained public ASMR-Kikoeru source/reference repo is checked out at:
 
@@ -139,10 +144,10 @@ GB2312 data is decoded, with GBK replacement as fallback, and written as UTF-8.
 Current library coverage:
 
 ```text
-97 works total
-49 works with at least one on-disk subtitle
-48 works without an on-disk subtitle
-791 VTT, 168 LRC, and 1 SRT files
+116 works total
+107 works with at least one on-disk subtitle
+9 works without an on-disk subtitle
+2562 VTT, 214 LRC, and 1 SRT files
 ```
 
 ASMRoner's local metadata marks 48 exact editions as having subtitles, but
@@ -168,21 +173,23 @@ appears in the Kikoeru viewer. NeoKikoeru must temporarily be running, logged
 in, and have a valid JWT. `asmr-library build` now wraps that maintenance
 sequence.
 
-The Kikoeru endpoint `POST /api/admin/reindex` currently returns HTTP 200 even
-when its internal NeoKikoeru requests fail. Inspect the JSON `results.scan`
-and `results.index` values; do not treat HTTP status alone as success.
+The Kikoeru endpoint `POST /api/admin/reindex` requires dashboard admin Basic
+authentication and returns HTTP 503 when the local reindex command fails.
+Automation should prefer `<ASMR_STACK_ROOT>/bin/asmr-library reindex` so no
+credential is embedded in a command line.
 
 ## Operator dashboard
 
 ```sh
 <ASMR_STACK_ROOT>/bin/asmr-library build
-<ASMR_STACK_ROOT>/bin/asmr-library dashboard --host 127.0.0.1 --port 8891
+<ASMR_STACK_ROOT>/bin/asmr-library dashboard
 ```
 
 `build` runs the NeoKikoeru maintenance sequence. The dashboard reports stack
 health, library counts, subtitle coverage, work lookup, safe
 download/retry/fill actions, subtitle dry-run/fetch actions, and the build
-workflow. Default bind is localhost.
+workflow. The viewer intentionally binds port 8890 to the trusted LAN; all
+maintenance and media-mutating dashboard actions require admin credentials.
 
 ## Subtitle playback
 
@@ -201,11 +208,9 @@ the behavior of the installed Python code.
 ## Known gaps
 
 - Download and fill do not automatically refresh NeoKikoeru afterward.
-- `status` reports `COMPLETE` based only on the RJ directory existing; it does
-  not compare the local file tree with the remote manifest.
 - Positional subtitle matching can silently pair the wrong tracks when remote
   and local folder ordering differs.
-- The ASMR viewer binds to all interfaces and has mock authentication. It
-  should only be exposed on a trusted LAN.
-- NeoKikoeru's generated config also currently binds to all interfaces when it
-  is started.
+- Kikoeru playback authentication remains compatibility-only. The separate
+  dashboard Basic credential protects operational mutations.
+- NeoKikoeru maintenance binds to loopback and should stop after build/reindex
+  when the wrapper started it.
