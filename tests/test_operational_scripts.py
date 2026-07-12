@@ -1,5 +1,5 @@
-import json
 import os
+import re
 import sqlite3
 import subprocess
 import tempfile
@@ -56,26 +56,38 @@ class OperationalScriptTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0)
             self.assertIn("COMPLETE", result.stdout)
 
-    def test_neo_config_redacts_secrets_by_default(self):
-        script = ROOT / "Web-UI/bin/neokikoeru-serve"
-        with tempfile.TemporaryDirectory() as tmp:
-            base = Path(tmp)
-            state = base / "state"
-            state.mkdir()
-            (state / "serve-config.json").write_text(
-                json.dumps({"admin_user": "admin", "admin_password": "secret-pass", "token": "secret-jwt"}),
-                encoding="utf-8",
-            )
-            env = {**os.environ, "HOME": str(base / "home"), "ASMR_STATE_ROOT": str(state)}
-            result = subprocess.run([str(script), "config"], env=env, text=True, capture_output=True, check=True)
-            self.assertNotIn("secret-pass", result.stdout)
-            self.assertNotIn("secret-jwt", result.stdout)
-            self.assertEqual(result.stdout.count("[redacted]"), 2)
-
     def test_cover_workflow_uses_local_reindex(self):
         script = (ROOT / "Web-UI/bin/asmr-fix-covers-workflow").read_text(encoding="utf-8")
         self.assertIn('"${LIB_BIN}" reindex', script)
         self.assertNotIn('POST "${VIEW_URL}/api/admin/reindex"', script)
+
+    def test_reindex_uses_native_scanner_without_maintenance_port(self):
+        script = (ROOT / "Web-UI/bin/asmr-library").read_text(encoding="utf-8")
+        match = re.search(r"run_reindex\(\) \{(?P<body>.*?)\n\}", script, re.S)
+        self.assertIsNotNone(match)
+        body = match.group("body")
+        self.assertIn('bin/asmr-native-scan', body)
+        self.assertNotIn('neokikoeru-serve', body)
+        self.assertNotIn('storage scan', body)
+
+        build = re.search(r"run_build\(\) \{(?P<body>.*?)\n\}", script, re.S)
+        self.assertIsNotNone(build)
+        self.assertIn('bin/asmr-native-scan', build.group("body"))
+        self.assertIn('--rebuild-content', build.group("body"))
+
+    def test_active_stack_has_no_separate_worker_dependency(self):
+        active = [
+            ROOT / "Web-UI/bin/asmr-library",
+            ROOT / "Web-UI/bin/asmr-view",
+            ROOT / "Web-UI/bin/asmr-neo",
+            ROOT / "Web-UI/bin/asmr-dashboard",
+            ROOT / "Web-UI/bin/media-stack-health",
+            ROOT / "scripts/status.sh",
+        ]
+        text = "\n".join(path.read_text(encoding="utf-8") for path in active)
+        self.assertNotIn("8889", text)
+        self.assertNotIn("neokikoeru-serve", text)
+        self.assertNotIn("/api/v1", text)
 
 
 if __name__ == "__main__":

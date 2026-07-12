@@ -1,0 +1,395 @@
+#!/usr/bin/env python3
+"""Synchronize direct RJ work folders with the native NeoKikoeru database."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Iterable
+
+
+RJ_RE = re.compile(r"^RJ\d+$")
+DEFAULT_LIBRARY = "/Volumes/TOSHIBA/AMSR"
+DEFAULT_API = "https://api.asmr.one/api"
+USER_AGENT = "asmr-native-scan/1.0 (+local NeoKikoeru library synchronizer)"
+REQUIRED_TABLES = {
+    "works", "files", "makers", "series", "genres", "artists", "illustrators",
+    "genre_works", "artist_works", "illustrator_works",
+}
+
+
+def env_path(primary: str, secondary: str | None, default: str) -> Path:
+    value = os.environ.get(primary)
+    if not value and secondary:
+        value = os.environ.get(secondary)
+    return Path(os.path.expanduser(value or default))
+
+
+def parse_args() -> argparse.Namespace:
+    home = str(Path.home())
+    parser = argparse.ArgumentParser(
+        description="Sync direct RJ folders into NeoKikoeru without rescanning existing content."
+    )
+    parser.add_argument("--dry-run", action="store_true", help="report changes without writes or downloads")
+    parser.add_argument(
+        "--rebuild-content",
+        action="store_true",
+        help="rebuild file rows for every local work after metadata reconciliation",
+    )
+    parser.add_argument("--library-root", type=Path, default=env_path("ASMR_LIBRARY_ROOT", "ASMR_MEDIA_ROOT", DEFAULT_LIBRARY))
+    parser.add_argument("--db", type=Path, default=env_path("NEOKIKOERU_DB", None, f"{home}/Library/Application Support/neokikoeru/neokikoeru.db"))
+    parser.add_argument("--covers-root", type=Path, default=env_path("NEOKIKOERU_COVERS_ROOT", "ASMR_COVERS_ROOT", f"{home}/Library/Application Support/neokikoeru/covers"))
+    parser.add_argument("--api-base", default=os.environ.get("ASMR_API_BASE", DEFAULT_API), help="API root ending in /api")
+    parser.add_argument("--timeout", type=float, default=float(os.environ.get("ASMR_SCAN_TIMEOUT", "15")))
+    parser.add_argument("--fix-content", type=Path, default=Path(__file__).with_name("asmr-fix-content-workflow"))
+    return parser.parse_args()
+
+
+def direct_rj_folders(root: Path) -> set[str]:
+    if not root.is_dir():
+        raise RuntimeError(f"library root is not a directory: {root}")
+    return {p.name for p in root.iterdir() if p.is_dir() and RJ_RE.fullmatch(p.name)}
+
+
+def connect_db(path: Path, timeout: float) -> sqlite3.Connection:
+    if not path.is_file():
+        raise RuntimeError(f"NeoKikoeru database not found: {path}")
+    conn = sqlite3.connect(path, timeout=timeout)
+    conn.row_factory = sqlite3.Row
+    conn.execute(f"PRAGMA busy_timeout = {max(1, int(timeout * 1000))}")
+    tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    missing = sorted(REQUIRED_TABLES - tables)
+    if missing:
+        conn.close()
+        raise RuntimeError(f"database schema is missing required tables: {', '.join(missing)}")
+    return conn
+
+
+def request_bytes(url: str, timeout: float) -> bytes:
+    request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Accept": "application/json,image/*;q=0.9,*/*;q=0.1"})
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return response.read()
+
+
+def fetch_metadata(api_base: str, rj: str, timeout: float) -> dict[str, Any]:
+    numeric = str(int(rj[2:]))
+    url = f"{api_base.rstrip('/')}/workInfo/{urllib.parse.quote(numeric)}"
+    payload = json.loads(request_bytes(url, timeout).decode("utf-8"))
+    if not isinstance(payload, dict) or not payload.get("title"):
+        raise RuntimeError(f"unexpected metadata response for {rj}")
+    return payload
+
+
+def cover_paths(rj: str) -> tuple[str, str]:
+    digits = rj[2:]
+    bucket = ((int(digits) + 999) // 1000) * 1000
+    width = max(6, len(digits))
+    prefix = f"doujin/RJ{bucket:0{width}d}"
+    return f"{prefix}/{rj}_img_main.jpg", f"{prefix}/{rj}_img_sam.jpg"
+
+
+def image_ok(path: Path) -> bool:
+    try:
+        if path.stat().st_size < 100:
+            return False
+        with path.open("rb") as handle:
+            header = handle.read(12)
+        return header.startswith(b"\xff\xd8\xff") or header.startswith(b"\x89PNG\r\n\x1a\n") or header[:4] in (b"RIFF", b"GIF8")
+    except OSError:
+        return False
+
+
+def localized_name(item: dict[str, Any]) -> str:
+    i18n = item.get("i18n") or {}
+    for locale in ("zh-cn", "ja-jp", "en-us"):
+        value = i18n.get(locale)
+        if isinstance(value, dict) and value.get("name"):
+            return str(value["name"])
+    return str(item.get("name") or item.get("title") or "")
+
+
+def objects(value: Any) -> list[dict[str, Any]]:
+    if isinstance(value, dict):
+        return [value]
+    if isinstance(value, list):
+        return [item for item in value if isinstance(item, dict)]
+    return []
+
+
+def entity_id(item: dict[str, Any], prefix: str) -> str:
+    value = item.get("source_id") or item.get("id")
+    if value is None:
+        name = str(item.get("name") or "")
+        return f"{prefix}:{name}"
+    return str(value)
+
+
+def epoch_ms(value: Any) -> int | None:
+    if not value:
+        return None
+    try:
+        text = str(value).strip()
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return int(parsed.timestamp() * 1000)
+    except (TypeError, ValueError):
+        return None
+
+
+def upsert_metadata(conn: sqlite3.Connection, rj: str, data: dict[str, Any], now: int) -> None:
+    main, thumb = cover_paths(rj)
+    circle = data.get("circle") if isinstance(data.get("circle"), dict) else {}
+    maker_id = str(circle.get("source_id") or (f"RG{circle['id']}" if circle.get("id") is not None else "")) or None
+    if maker_id:
+        conn.execute(
+            "INSERT INTO makers(id,name) VALUES(?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name",
+            (maker_id, str(circle.get("name") or data.get("name") or maker_id)),
+        )
+
+    series_items = objects(data.get("series"))
+    series_id = None
+    if series_items:
+        series_id = entity_id(series_items[0], "series")
+        conn.execute(
+            "INSERT INTO series(id,name) VALUES(?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name",
+            (series_id, localized_name(series_items[0]) or series_id),
+        )
+
+    existing = conn.execute("SELECT created_at FROM works WHERE id=?", (rj,)).fetchone()
+    created_at = int(existing["created_at"]) if existing else now
+    values = (
+        rj, str(data.get("title") or rj), main, thumb,
+        str(data.get("intro") or data.get("description") or ""),
+        3 if data.get("nsfw", True) else 1,
+        int(data.get("price") or 0), int(data.get("dl_count") or data.get("sales") or 0),
+        int(data.get("wishlist_count") or 0), float(data.get("rate_average_2dp") or data.get("rating") or 0),
+        int(data.get("rate_count") or 0), int(data.get("review_count") or 0),
+        epoch_ms(data.get("release")), data.get("original_workno"), created_at, now, maker_id, series_id,
+    )
+    conn.execute(
+        """INSERT INTO works(id,name,image_main,image_thumb,intro,age_category,price,sales,wishlist_count,rating,rating_count,review_count,released_at,original_id,created_at,updated_at,maker_id,series_id)
+           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+           ON CONFLICT(id) DO UPDATE SET name=excluded.name,image_main=excluded.image_main,image_thumb=excluded.image_thumb,
+             intro=excluded.intro,age_category=excluded.age_category,price=excluded.price,sales=excluded.sales,
+             wishlist_count=excluded.wishlist_count,rating=excluded.rating,rating_count=excluded.rating_count,
+             review_count=excluded.review_count,released_at=excluded.released_at,original_id=excluded.original_id,
+             updated_at=excluded.updated_at,maker_id=excluded.maker_id,series_id=excluded.series_id""",
+        values,
+    )
+
+    joins: tuple[tuple[str, str, str, Iterable[dict[str, Any]], str], ...] = (
+        ("genres", "genre_works", "genre_id", objects(data.get("tags")), "genre"),
+        ("artists", "artist_works", "artist_id", objects(data.get("vas")), "artist"),
+        ("illustrators", "illustrator_works", "illustrator_id", objects(data.get("illustrators")), "illustrator"),
+    )
+    for table, join_table, join_column, items, prefix in joins:
+        conn.execute(f"DELETE FROM {join_table} WHERE work_id=?", (rj,))
+        for item in items:
+            eid = entity_id(item, prefix)
+            if table == "genres":
+                try:
+                    eid = int(item.get("id"))
+                except (TypeError, ValueError):
+                    continue
+            name = localized_name(item) or str(eid)
+            conn.execute(f"INSERT INTO {table}(id,name) VALUES(?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name", (eid, name))
+            conn.execute(f"INSERT OR IGNORE INTO {join_table}({join_column},work_id) VALUES(?,?)", (eid, rj))
+
+
+def remove_work(conn: sqlite3.Connection, rj: str) -> None:
+    available = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    for table in ("histories", "likes", "files", "genre_works", "artist_works", "illustrator_works"):
+        if table not in available:
+            continue
+        conn.execute(f"DELETE FROM {table} WHERE work_id=?", (rj,))
+    conn.execute("DELETE FROM works WHERE id=?", (rj,))
+
+
+def prune_orphans(conn: sqlite3.Connection) -> None:
+    conn.execute("DELETE FROM makers WHERE id NOT IN (SELECT maker_id FROM works WHERE maker_id IS NOT NULL)")
+    conn.execute("DELETE FROM series WHERE id NOT IN (SELECT series_id FROM works WHERE series_id IS NOT NULL)")
+    conn.execute("DELETE FROM genres WHERE id NOT IN (SELECT genre_id FROM genre_works)")
+    conn.execute("DELETE FROM artists WHERE id NOT IN (SELECT artist_id FROM artist_works)")
+    conn.execute("DELETE FROM illustrators WHERE id NOT IN (SELECT illustrator_id FROM illustrator_works)")
+
+
+def download_cover(url: str, destination: Path, timeout: float) -> None:
+    data = request_bytes(url, timeout)
+    if len(data) < 100 or not (data.startswith(b"\xff\xd8\xff") or data.startswith(b"\x89PNG")):
+        raise RuntimeError(f"cover response is not a valid image: {url}")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=f".{destination.name}.", dir=destination.parent)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, destination)
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+
+
+def cover_urls(data: dict[str, Any], kind: str, api_base: str, rj: str) -> list[str]:
+    key = "mainCoverUrl" if kind == "main" else "samCoverUrl"
+    numeric = str(int(rj[2:]))
+    urls = [str(data[key])] if data.get(key) else []
+    if kind == "sam" and data.get("thumbnailCoverUrl"):
+        urls.append(str(data["thumbnailCoverUrl"]))
+    urls.append(f"{api_base.rstrip('/')}/cover/{numeric}.jpg?type={kind}")
+    return list(dict.fromkeys(urls))
+
+
+def main() -> int:
+    args = parse_args()
+    counts = {"added": 0, "updated": 0, "removed": 0, "covers": 0, "failed": 0}
+    failures: list[str] = []
+    try:
+        local = direct_rj_folders(args.library_root)
+        conn = connect_db(args.db, args.timeout)
+    except Exception as exc:
+        print(f"asmr-native-scan: {exc}", file=sys.stderr)
+        return 2
+
+    try:
+        rows = {row["id"]: row for row in conn.execute("SELECT id,image_main,image_thumb FROM works WHERE id GLOB 'RJ[0-9]*'")}
+        database = set(rows)
+        added = sorted(local - database)
+        removed = sorted(database - local)
+        damaged: list[str] = []
+        for rj in sorted(local & database):
+            row = rows[rj]
+            main_rel, thumb_rel = cover_paths(rj)
+            main = args.covers_root / (row["image_main"] or main_rel)
+            thumb = args.covers_root / (row["image_thumb"] or thumb_rel)
+            if not image_ok(main) or not image_ok(thumb):
+                damaged.append(rj)
+        content_roots = {
+            row["work_id"] for row in conn.execute(
+                "SELECT DISTINCT work_id FROM files WHERE work_id IS NOT NULL AND parent_id IS NULL AND is_folder=1"
+            )
+        }
+        content_missing = sorted((local & database) - content_roots)
+        content_targets = sorted(local) if args.rebuild_content else sorted(set(added) | set(content_missing))
+
+        if args.dry_run:
+            counts["added"] = len(added)
+            counts["updated"] = len(set(damaged) | set(content_missing))
+            counts["removed"] = len(removed)
+            for rj in added:
+                print(f"DRY-RUN add {rj}")
+            for rj in damaged:
+                print(f"DRY-RUN refresh missing/broken cover {rj}")
+            for rj in content_missing:
+                print(f"DRY-RUN rebuild missing content index {rj}")
+            if args.rebuild_content:
+                print(f"DRY-RUN rebuild all content indexes ({len(content_targets)} works)")
+            for rj in removed:
+                print(f"DRY-RUN remove DB rows {rj}")
+        else:
+            metadata: dict[str, dict[str, Any]] = {}
+            for rj in added + damaged:
+                try:
+                    metadata[rj] = fetch_metadata(args.api_base, rj, args.timeout)
+                except Exception as exc:
+                    counts["failed"] += 1
+                    failures.append(f"{rj}: metadata: {exc}")
+
+            now = int(time.time() * 1000)
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                for rj in removed:
+                    remove_work(conn, rj)
+                    counts["removed"] += 1
+                for rj in added:
+                    if rj in metadata:
+                        upsert_metadata(conn, rj, metadata[rj], now)
+                        counts["added"] += 1
+                prune_orphans(conn)
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+
+            for rj, data in metadata.items():
+                main_rel, thumb_rel = cover_paths(rj)
+                for kind, relative in (("main", main_rel), ("sam", thumb_rel)):
+                    destination = args.covers_root / relative
+                    if image_ok(destination):
+                        continue
+                    errors = []
+                    for url in cover_urls(data, kind, args.api_base, rj):
+                        try:
+                            download_cover(url, destination, args.timeout)
+                            counts["covers"] += 1
+                            break
+                        except Exception as exc:
+                            errors.append(str(exc))
+                    else:
+                        counts["failed"] += 1
+                        failures.append(f"{rj}: {kind} cover: {'; '.join(errors)}")
+
+            updated_ids: set[str] = set()
+            for rj in damaged:
+                if rj not in metadata:
+                    continue
+                main_rel, thumb_rel = cover_paths(rj)
+                if image_ok(args.covers_root / main_rel) and image_ok(args.covers_root / thumb_rel):
+                    try:
+                        with conn:
+                            conn.execute(
+                                "UPDATE works SET image_main=?, image_thumb=?, updated_at=? WHERE id=?",
+                                (main_rel, thumb_rel, int(time.time() * 1000), rj),
+                            )
+                        updated_ids.add(rj)
+                    except Exception as exc:
+                        counts["failed"] += 1
+                        failures.append(f"{rj}: cover paths: {exc}")
+
+            for rj in content_targets:
+                if rj in added and rj not in metadata:
+                    continue
+                try:
+                    child_env = os.environ.copy()
+                    child_env["ASMR_LIBRARY_ROOT"] = str(args.library_root)
+                    child_env["NEOKIKOERU_DB"] = str(args.db)
+                    subprocess.run(
+                        [str(args.fix_content), rj], check=True,
+                        timeout=max(30.0, args.timeout * 20), env=child_env,
+                    )
+                except Exception as exc:
+                    counts["failed"] += 1
+                    failures.append(f"{rj}: content index: {exc}")
+                else:
+                    if rj not in added:
+                        updated_ids.add(rj)
+            counts["updated"] = len(updated_ids)
+    except Exception as exc:
+        counts["failed"] += 1
+        failures.append(f"scan: {exc}")
+    finally:
+        conn.close()
+
+    for failure in failures:
+        print(f"FAILED {failure}", file=sys.stderr)
+    print("summary " + " ".join(f"{key}={value}" for key, value in counts.items()))
+    return 1 if counts["failed"] else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

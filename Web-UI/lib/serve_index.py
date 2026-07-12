@@ -14,6 +14,7 @@ import os
 import re
 import shutil
 import sys
+import tempfile
 from pathlib import Path
 
 AUDIO_EXTS = {".mp3", ".wav", ".flac", ".m4a", ".aac", ".ogg", ".opus"}
@@ -38,14 +39,7 @@ def is_complete(work: Path) -> tuple[bool, str]:
     return True, "ok"
 
 
-def build_index(source_root: Path, index_root: Path) -> tuple[int, int, int]:
-    if not source_root.is_dir():
-        print(f"source root missing: {source_root}", file=sys.stderr)
-        return 0, 0, 0
-    if index_root.exists():
-        shutil.rmtree(index_root)
-    index_root.mkdir(parents=True, exist_ok=True)
-
+def _build_index_tree(source_root: Path, build_root: Path) -> tuple[int, int, int]:
     works_indexed = 0
     works_skipped = 0
     links_created = 0
@@ -58,7 +52,7 @@ def build_index(source_root: Path, index_root: Path) -> tuple[int, int, int]:
             print(f"skip {rj}: {reason}", file=sys.stderr)
             works_skipped += 1
             continue
-        target = index_root / rj
+        target = build_root / rj
         target.mkdir(parents=True, exist_ok=True)
         for item in work.rglob("*"):
             if not item.is_file():
@@ -72,6 +66,52 @@ def build_index(source_root: Path, index_root: Path) -> tuple[int, int, int]:
             links_created += 1
         works_indexed += 1
     return works_indexed, works_skipped, links_created
+
+
+def _replace_index(build_root: Path, index_root: Path) -> None:
+    """Install a completed index, restoring the old one if the swap fails."""
+    backup_root = Path(tempfile.mkdtemp(
+        prefix=f".{index_root.name}.backup-", dir=index_root.parent
+    ))
+    backup_root.rmdir()
+    had_index = index_root.exists() or index_root.is_symlink()
+    if had_index:
+        os.replace(index_root, backup_root)
+    try:
+        os.replace(build_root, index_root)
+    except BaseException:
+        if had_index:
+            try:
+                os.replace(backup_root, index_root)
+            except BaseException as restore_error:
+                raise RuntimeError(
+                    f"index install failed and backup restore failed; "
+                    f"old index remains at {backup_root}"
+                ) from restore_error
+        raise
+    if backup_root.exists() or backup_root.is_symlink():
+        if backup_root.is_dir() and not backup_root.is_symlink():
+            shutil.rmtree(backup_root)
+        else:
+            backup_root.unlink()
+
+
+def build_index(source_root: Path, index_root: Path) -> tuple[int, int, int]:
+    if not source_root.is_dir():
+        print(f"source root missing: {source_root}", file=sys.stderr)
+        return 0, 0, 0
+
+    index_root.parent.mkdir(parents=True, exist_ok=True)
+    build_root = Path(tempfile.mkdtemp(
+        prefix=f".{index_root.name}.build-", dir=index_root.parent
+    ))
+    try:
+        result = _build_index_tree(source_root, build_root)
+        _replace_index(build_root, index_root)
+        return result
+    finally:
+        if build_root.exists():
+            shutil.rmtree(build_root)
 
 
 def main() -> int:

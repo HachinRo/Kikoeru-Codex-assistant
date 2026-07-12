@@ -417,6 +417,46 @@ def find_lrc_for_audio(conn, work_id: str, audio_hash: str) -> str | None:
     return None
 
 
+def list_subtitles_for_audio(conn, work_id: str, audio_hash: str) -> list[dict]:
+    """List selectable subtitles for an audio track, best match first.
+
+    A filename match remains the default. Other subtitles in the same folder
+    are ranked next, followed by the rest of the work, so a user can recover
+    from mismatched or unconventional filenames in the lyrics preview.
+    """
+    audio = conn.execute(
+        "SELECT parent_id FROM files WHERE id = ? AND work_id = ?",
+        (audio_hash, work_id),
+    ).fetchone()
+    if audio is None:
+        return []
+
+    default_hash = find_lrc_for_audio(conn, work_id, audio_hash)
+    rows = conn.execute(
+        """SELECT id, name, parent_id, path
+           FROM files
+           WHERE work_id = ? AND is_folder = 0""",
+        (work_id,),
+    ).fetchall()
+    subtitles = [
+        row for row in rows
+        if any(str(row["name"]).lower().endswith(ext) for ext in SUBTITLE_EXTS)
+    ]
+    subtitles.sort(key=lambda row: (
+        0 if row["id"] == default_hash else 1,
+        0 if row["parent_id"] == audio["parent_id"] else 1,
+        natural_file_sort_key(row["name"]),
+    ))
+    result = []
+    for row in subtitles:
+        path = str(row["path"] or "").lstrip("/")
+        prefix = work_id + "/"
+        if path.startswith(prefix):
+            path = path[len(prefix):]
+        result.append({"hash": row["id"], "title": path or row["name"]})
+    return result
+
+
 def get_subtitle_format(conn, sub_hash: str) -> str:
     """Return the lowercase extension of a subtitle file (.lrc/.vtt/etc)
     or "" if not found. Used to pick the conversion path when serving.

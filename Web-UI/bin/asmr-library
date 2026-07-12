@@ -21,18 +21,16 @@ Usage:
   asmr-library fill RJ01234567 [RJ...]
   asmr-library search <RJID-or-query> [asmroner search flags]
   asmr-library sync [asmroner sync args]
-  asmr-library fetch-neokikoeru
-  asmr-library build                    # run NeoKikoeru start/login/scan/index/tasks
-  asmr-library reindex                  # run NeoKikoeru metadata/cover scan only
+  asmr-library build                    # native metadata/cover reconciliation + full file-row rebuild
+  asmr-library reindex                  # reconcile local works/metadata/covers without a maintenance port
   asmr-library dashboard                  # show integrated dashboard URL on port 8890
-  asmr-library serve [start|stop|status|login|storage|logs|version|init|config]
   asmr-library config [asmroner config args]
   asmr-library version
   asmr-library files <RJ>               # list files in a work (DB-backed, no license needed)
-  asmr-library fcat <file_id>           # stream a file from Neokikoeru to stdout
-  asmr-library fget <file_id> [out]     # download a file from Neokikoeru
-  asmr-library works [page]             # list works via Neokikoeru API
-  asmr-library work <RJ>                # get work metadata via Neokikoeru API
+  asmr-library fcat <file_id>           # stream an indexed file through port 8890
+  asmr-library fget <file_id> [out]     # download an indexed file through port 8890
+  asmr-library works [page]             # list works through the port 8890 API
+  asmr-library work <RJ>                # get work metadata through the port 8890 API
   asmr-library subs <login|check|fetch|list-missing|search-missing|fetch-missing> ...
                                        # fetch Chinese subtitles from asmr.one;
                                        # auto-discovers the sub-having sibling RJ
@@ -41,13 +39,9 @@ Usage:
   asmr-library asmroner <raw asmroner args>
 
 Safe library commands (download/status/retry) go through asmr-library-worker.
-serve manages the loopback-only NeoKikoeru maintenance service.
-listen has been removed: Neokikoeru replaces ASMRoner's listen path.
+Viewing, indexing, metadata, and media streaming use the consolidated port 8890 stack.
+listen has been removed; asmr-view owns the listening path.
 ASMRoner utility commands run from the ASMR stack root so its config is found.
-
-Neokikoeru's native file list is license-gated (only chobit.cc preview shows for
-unactivated installs). The files/fcat/fget/works/work/subcommands use the
-unencrypted API + direct DB read to give you the full file view without a license.
 USAGE
 }
 
@@ -130,259 +124,16 @@ run_asmroner_capture() {
     "${ASMRONER_BIN}" "$@"
 }
 
-neo_jwt_is_current() {
-    python3 - "${STATE_ROOT}/serve-config.json" <<'PY'
-import datetime
-import json
-import sys
-
-try:
-    with open(sys.argv[1], encoding="utf-8") as f:
-        cfg = json.load(f)
-except Exception:
-    sys.exit(1)
-
-if not str(cfg.get("token") or "").strip():
-    sys.exit(1)
-
-expires_at = str(cfg.get("token_expires_at") or "").strip()
-if not expires_at:
-    sys.exit(1)
-
-try:
-    if expires_at.endswith("Z"):
-        expires_at = expires_at[:-1] + "+00:00"
-    expiry = datetime.datetime.fromisoformat(expires_at)
-    if expiry.tzinfo is None:
-        expiry = expiry.replace(tzinfo=datetime.timezone.utc)
-except Exception:
-    sys.exit(1)
-
-if expiry <= datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(minutes=5):
-    sys.exit(1)
-PY
-}
-
-ensure_neo_jwt() {
-    neo_serve_bin="$1"
-    if neo_jwt_is_current; then
-        printf '%s\n' "Using saved NeoKikoeru JWT."
-    else
-        printf '%s\n' "Ensuring NeoKikoeru JWT..."
-        "${neo_serve_bin}" login
-    fi
-}
-
-neo_log_size() {
-    log_file="${STATE_ROOT}/logs/serve.log"
-    if [ -f "${log_file}" ]; then
-        python3 - "${log_file}" <<'PY'
-from pathlib import Path
-import sys
-try:
-    print(Path(sys.argv[1]).stat().st_size)
-except OSError:
-    print(0)
-PY
-    else
-        printf '%s\n' "0"
-    fi
-}
-
-neo_new_log_errors() {
-    start_size="$1"
-    log_file="${STATE_ROOT}/logs/serve.log"
-    [ -f "${log_file}" ] || return 0
-    python3 - "${log_file}" "${start_size}" <<'PY'
-from pathlib import Path
-import sys
-
-path = Path(sys.argv[1])
-try:
-    start = max(0, int(sys.argv[2]))
-except (TypeError, ValueError):
-    start = 0
-
-try:
-    with path.open("rb") as f:
-        f.seek(start)
-        text = f.read().decode("utf-8", "replace")
-except OSError:
-    sys.exit(0)
-
-errors = [
-    line for line in text.splitlines()
-    if '"level":"error"' in line or '"level": "error"' in line
-]
-if errors:
-    print("NeoKikoeru logged errors during this operation:")
-    for line in errors[-20:]:
-        print(line)
-    sys.exit(1)
-PY
-}
-
-neo_extract_task_id() {
-    python3 -c '
-import json
-import re
-import sys
-
-text = sys.stdin.read()
-for line in text.splitlines():
-    line = line.strip()
-    if not line.startswith("{"):
-        continue
-    try:
-        item = json.loads(line)
-    except Exception:
-        continue
-    task_id = item.get("id")
-    if task_id:
-        print(task_id)
-        raise SystemExit(0)
-m = re.search(r"task id:\s*([0-9a-fA-F-]+)", text)
-if m:
-    print(m.group(1))
-'
-}
-
-neo_filter_task_output() {
-    python3 -c '
-import sys
-
-ids = [arg[:8] for arg in sys.argv[1:] if arg]
-text = sys.stdin.read()
-if not ids:
-    print(text, end="")
-    raise SystemExit(0)
-for line in text.splitlines():
-    if any(f"[{task_id}" in line for task_id in ids):
-        print(line)
-' "$@"
-}
-
-neo_task_output_failed() {
-    python3 -c "
-import re
-import sys
-
-text = sys.stdin.read()
-failed_lines = []
-for line in text.splitlines():
-    if re.search(r'\\b[1-9][0-9]* failed\\b', line):
-        failed_lines.append(line)
-    elif re.search(r'\\bfailed\\b', line, re.I) and not re.search(r'\\b0 failed\\b', line):
-        failed_lines.append(line)
-
-if failed_lines:
-    print('NeoKikoeru task failures:')
-    for line in failed_lines[-20:]:
-        print(line)
-    sys.exit(1)
-"
-}
-
-neo_wait_for_tasks() {
-    serve_bin="$1"
-    shift
-    deadline="$(( $(date +%s) + 900 ))"
-    task_output=""
-    relevant_output=""
-    while :; do
-        task_output="$("${serve_bin}" tasks)"
-        relevant_output="$(printf '%s\n' "${task_output}" | neo_filter_task_output "$@")"
-        if [ -n "${relevant_output}" ] && ! printf '%s\n' "${relevant_output}" | grep -E 'running|queued|pending' >/dev/null 2>&1; then
-            printf '%s\n' "${relevant_output}"
-            return 0
-        fi
-        if [ "$(date +%s)" -ge "${deadline}" ]; then
-            printf '%s\n' "${relevant_output:-${task_output}}"
-            printf '%s\n' "Timed out waiting for NeoKikoeru tasks: $*" >&2
-            return 1
-        fi
-        sleep 2
-    done
-}
-
-neo_maintenance_started_here=0
-neo_maintenance_serve_bin=""
-
-neo_maintenance_cleanup() {
-    if [ "${neo_maintenance_started_here}" -eq 1 ] && [ -n "${neo_maintenance_serve_bin}" ]; then
-        "${neo_maintenance_serve_bin}" stop >/dev/null 2>&1 || true
-    fi
-}
-
-neo_maintenance_start() {
-    neo_maintenance_serve_bin="$1"
-    if "${neo_maintenance_serve_bin}" status >/dev/null 2>&1; then
-        neo_maintenance_started_here=0
-    else
-        neo_maintenance_started_here=1
-    fi
-    trap neo_maintenance_cleanup EXIT
-    "${neo_maintenance_serve_bin}" start --no-index
-}
-
-neo_maintenance_finish() {
-    neo_maintenance_cleanup
-    trap - EXIT
-}
-
 run_build() {
-    serve_bin="${STATE_ROOT}/bin/neokikoeru-serve"
-    [ -x "${serve_bin}" ] || fail "neokikoeru-serve is missing or not executable: ${serve_bin}"
-    storage_id="${ASMR_STORAGE_ID:-1}"
-    printf '%s\n' "Starting NeoKikoeru maintenance service..."
-    neo_maintenance_start "${serve_bin}"
-    ensure_neo_jwt "${serve_bin}"
-    log_start="$(neo_log_size)"
-    printf '%s\n' "Triggering DLsite metadata scan for storage ${storage_id}..."
-    scan_output="$("${serve_bin}" storage scan "${storage_id}")"
-    printf '%s\n' "${scan_output}"
-    scan_task_id="$(printf '%s\n' "${scan_output}" | neo_extract_task_id)"
-    printf '%s\n' "Triggering filesystem index for storage ${storage_id}..."
-    index_output="$("${serve_bin}" storage index "${storage_id}")"
-    printf '%s\n' "${index_output}"
-    index_task_id="$(printf '%s\n' "${index_output}" | neo_extract_task_id)"
-    printf '%s\n' "Current NeoKikoeru tasks:"
-    task_output="$(neo_wait_for_tasks "${serve_bin}" "${scan_task_id}" "${index_task_id}")"
-    printf '%s\n' "${task_output}"
-    task_status=0
-    printf '%s\n' "${task_output}" | neo_task_output_failed || task_status=$?
-    log_status=0
-    neo_new_log_errors "${log_start}" || log_status=$?
-    if [ "${task_status}" -ne 0 ] || [ "${log_status}" -ne 0 ]; then
-        return 1
-    fi
-    neo_maintenance_finish
+    scanner="${STATE_ROOT}/bin/asmr-native-scan"
+    [ -x "${scanner}" ] || fail "native ASMR scanner is missing or not executable: ${scanner}"
+    "${scanner}" --rebuild-content
 }
 
 run_reindex() {
-    serve_bin="${STATE_ROOT}/bin/neokikoeru-serve"
-    [ -x "${serve_bin}" ] || fail "neokikoeru-serve is missing or not executable: ${serve_bin}"
-
-    storage_id="${ASMR_STORAGE_ID:-1}"
-    printf '%s\n' "Starting NeoKikoeru maintenance service..."
-    neo_maintenance_start "${serve_bin}"
-    ensure_neo_jwt "${serve_bin}"
-    log_start="$(neo_log_size)"
-    printf '%s\n' "Triggering DLsite metadata/cover scan for storage ${storage_id}..."
-    scan_output="$("${serve_bin}" storage scan "${storage_id}")"
-    printf '%s\n' "${scan_output}"
-    scan_task_id="$(printf '%s\n' "${scan_output}" | neo_extract_task_id)"
-    printf '%s\n' "Current NeoKikoeru tasks:"
-    task_output="$(neo_wait_for_tasks "${serve_bin}" "${scan_task_id}")"
-    printf '%s\n' "${task_output}"
-    task_status=0
-    printf '%s\n' "${task_output}" | neo_task_output_failed || task_status=$?
-    log_status=0
-    neo_new_log_errors "${log_start}" || log_status=$?
-    if [ "${task_status}" -ne 0 ] || [ "${log_status}" -ne 0 ]; then
-        return 1
-    fi
-    neo_maintenance_finish
+    scanner="${STATE_ROOT}/bin/asmr-native-scan"
+    [ -x "${scanner}" ] || fail "native ASMR scanner is missing or not executable: ${scanner}"
+    "${scanner}"
 }
 
 build_listen_index() {
@@ -568,17 +319,14 @@ case "$1" in
     search|sync|config|completion|version)
         run_asmroner "$@"
         ;;
-    fetch-neokikoeru)
-        "${STATE_ROOT}/bin/neokikoeru-fetch"
-        ;;
 build)
         shift
-        [ "$#" -eq 0 ] || fail "build does not accept arguments. Set ASMR_STORAGE_ID to override storage id."
+        [ "$#" -eq 0 ] || fail "build does not accept arguments"
         run_build
         ;;
 reindex)
         shift
-        [ "$#" -eq 0 ] || fail "reindex does not accept arguments. Set ASMR_STORAGE_ID to override storage id."
+        [ "$#" -eq 0 ] || fail "reindex does not accept arguments"
         run_reindex
         ;;
 dashboard)
@@ -591,10 +339,6 @@ dashboard)
         printf '%s\n' "ASMR Library Dashboard: http://127.0.0.1:8890/asmr-library"
     fi
     ;;
-    serve)
-        shift
-        "${STATE_ROOT}/bin/neokikoeru-serve" "$@"
-        ;;
     asmroner)
         shift
         run_asmroner "$@"

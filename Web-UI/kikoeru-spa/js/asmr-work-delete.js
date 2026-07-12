@@ -1,5 +1,6 @@
 (function () {
   var buttonId = 'asmr-work-delete'
+  var refreshButtonId = 'asmr-work-refresh'
   var modalId = 'asmr-work-delete-modal'
   var currentPath = ''
 
@@ -28,6 +29,59 @@
     } catch (err) {
       return ''
     }
+  }
+
+  function waitAction (id) {
+    return new Promise(function (resolve, reject) {
+      function poll () {
+        jsonFetch('/api/asmr-library/actions/' + encodeURIComponent(id))
+          .then(function (action) {
+            if (action.status === 'running') return window.setTimeout(poll, 1200)
+            if (action.status === 'done') return resolve(action)
+            reject(new Error(action.error || action.output || 'Action failed'))
+          })
+          .catch(reject)
+      }
+      poll()
+    })
+  }
+
+  function refreshWork (workId, btn) {
+    var auth = dashboardAuthHeader()
+    if (!auth) {
+      window.alert('请先在管理面板保存管理员登录信息，然后再刷新作品。')
+      window.location.href = '/asmr-library'
+      return
+    }
+    btn.disabled = true
+    btn.setAttribute('aria-busy', 'true')
+    jsonFetch('/api/asmr-library/actions/fix-content', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': auth,
+        'X-ASMR-Dashboard-Request': '1'
+      },
+      body: JSON.stringify({ rj: workId })
+    }).then(function (action) {
+      return waitAction(action.id)
+    }).then(function () {
+      return jsonFetch('/api/admin/refresh-cache', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': auth,
+          'X-ASMR-Dashboard-Request': '1'
+        },
+        body: JSON.stringify({})
+      })
+    }).then(function () {
+      window.location.reload()
+    }).catch(function (err) {
+      btn.disabled = false
+      btn.removeAttribute('aria-busy')
+      window.alert('刷新作品失败: ' + err.message)
+    })
   }
 
   function showModal (workId, work) {
@@ -125,19 +179,34 @@
     var workId = workPathId()
     if (!workId) {
       removeNode(buttonId)
+      removeNode(refreshButtonId)
       removeNode(modalId)
       currentPath = ''
       return
     }
-    if (currentPath === window.location.pathname && document.getElementById(buttonId)) return
+    if (currentPath === window.location.pathname && document.getElementById(buttonId) && document.getElementById(refreshButtonId)) return
     currentPath = window.location.pathname
     removeNode(buttonId)
+    removeNode(refreshButtonId)
+
+    var salesRow = Array.prototype.find.call(document.querySelectorAll('.q-pt-sm.q-pb-none'), function (node) {
+      return /售出数\s*:/.test(node.textContent || '')
+    })
+    if (!salesRow) return
+
+    var refreshBtn = document.createElement('button')
+    refreshBtn.id = refreshButtonId
+    refreshBtn.type = 'button'
+    refreshBtn.title = '刷新作品'
+    refreshBtn.setAttribute('aria-label', '刷新作品')
+    refreshBtn.innerHTML = '<span class="material-icons">refresh</span>'
+    refreshBtn.addEventListener('click', function () { refreshWork(workId, refreshBtn) })
 
     var btn = document.createElement('button')
     btn.id = buttonId
     btn.type = 'button'
-    btn.title = 'Delete this work permanently'
-    btn.setAttribute('aria-label', 'Delete this work permanently')
+    btn.title = '删除作品'
+    btn.setAttribute('aria-label', '删除作品')
     btn.innerHTML = '<span class="material-icons">delete_forever</span>'
     btn.addEventListener('click', function () {
       btn.disabled = true
@@ -146,7 +215,8 @@
         .catch(function (err) { window.alert('Could not load work: ' + err.message) })
         .finally(function () { btn.disabled = false })
     })
-    document.body.appendChild(btn)
+    salesRow.appendChild(refreshBtn)
+    salesRow.appendChild(btn)
   }
 
   function patchHistory (name) {

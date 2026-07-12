@@ -258,8 +258,6 @@ Web-UI/*
 Web-UI/bin/*
 !Web-UI/bin/asmr-*
 !Web-UI/bin/media-stack-health
-!Web-UI/bin/neokikoeru-fetch
-!Web-UI/bin/neokikoeru-serve
 !Web-UI/bin/checksums.sha256
 !Web-UI/lib/
 Web-UI/lib/*
@@ -278,6 +276,7 @@ Web-UI/kikoeru-spa/js/*
 !Web-UI/kikoeru-spa/js/runtime.3597b51d.js
 !Web-UI/kikoeru-spa/js/vendor.86022408.js
 !Web-UI/kikoeru-spa/js/app.051b603f.fix10.js
+!Web-UI/kikoeru-spa/js/app.051b603f.fix11.js
 !Web-UI/kikoeru-spa/js/asmr-*.js
 !Web-UI/view/
 Web-UI/view/*

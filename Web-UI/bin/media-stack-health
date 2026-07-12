@@ -36,7 +36,7 @@ else
 fi
 
 if command -v lsof >/dev/null 2>&1; then
-    lsof -nP -iTCP:8889 -iTCP:8890 -iTCP:8891 -sTCP:LISTEN || true
+    lsof -nP -iTCP:8890 -sTCP:LISTEN || true
 else
     printf 'WARN: lsof is not installed\n'
 fi
