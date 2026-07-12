@@ -22,8 +22,8 @@ done
 
 test -f .gitmodules
 git config -f .gitmodules --get submodule.refs/ASMR-Kikoeru.url | grep -Fx 'https://github.com/HachinRo/ASMR-Kikoeru.git' >/dev/null
-test -f Web-UI/kikoeru-spa/js/app.051b603f.fix10.js
-grep -F 'app.051b603f.fix10.js' Web-UI/kikoeru-spa/index.html >/dev/null
+test -f Web-UI/kikoeru-spa/js/app.051b603f.fix11.js
+grep -F 'app.051b603f.fix11.js' Web-UI/kikoeru-spa/index.html >/dev/null
 if rg -n '\brtk\b' docs/skills; then
     echo "obsolete rtk reference in canonical skills" >&2
     exit 1
