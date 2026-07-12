@@ -4,6 +4,7 @@
     workId: '',
     subtitleHash: '',
     subtitleTitle: '',
+    subtitles: [],
     lines: [],
     activeIndex: -1,
     offset: 0,
@@ -292,6 +293,9 @@
     els.select = document.createElement('select')
     els.select.className = 'asmr-lyrics-panel__select'
     els.select.setAttribute('aria-label', 'Subtitle file')
+    els.select.addEventListener('change', function () {
+      loadSelectedSubtitle(els.select.value)
+    })
 
     els.close = document.createElement('button')
     els.close.type = 'button'
@@ -356,12 +360,18 @@
 
   function renderSelect () {
     if (!els.select) return
-    var title = state.subtitleTitle || (state.subtitleHash ? state.subtitleHash.replace(/@lrc$/, '') : 'Lyrics')
     els.select.innerHTML = ''
-    var option = document.createElement('option')
-    option.textContent = title
-    option.value = state.subtitleHash || title
-    els.select.appendChild(option)
+    var choices = state.subtitles.length
+      ? state.subtitles
+      : (state.subtitleHash ? [{ hash: state.subtitleHash, title: state.subtitleTitle }] : [])
+    choices.forEach(function (subtitle) {
+      var option = document.createElement('option')
+      option.textContent = subtitle.title || subtitle.hash.replace(/@lrc$/, '')
+      option.value = subtitle.hash
+      option.selected = subtitle.hash === state.subtitleHash
+      els.select.appendChild(option)
+    })
+    els.select.disabled = choices.length < 2
   }
 
   function renderLines () {
@@ -407,7 +417,7 @@
       row.appendChild(text)
       els.list.appendChild(row)
     })
-    updateActiveLine(false)
+    updateActiveLine(state.open)
   }
 
   function setOffset (value) {
@@ -422,6 +432,13 @@
     if (els.offsetInput) els.offsetInput.value = formatOffset(state.offset)
   }
 
+  function centerLine (row) {
+    window.requestAnimationFrame(function () {
+      if (!state.open || !els.list || !row.isConnected) return
+      els.list.scrollTop = Math.max(0, row.offsetTop - ((els.list.clientHeight - row.offsetHeight) / 2))
+    })
+  }
+
   function updateActiveLine (scrollIntoView) {
     if (!els.list || !state.lines.length) {
       state.activeIndex = -1
@@ -432,6 +449,15 @@
     var time = (audio ? audio.currentTime || 0 : 0) + state.offset
     var next = lineAtTime(time)
     if (next === state.activeIndex) {
+      if (next >= 0) {
+        var currentRow = els.list.querySelector('[data-index="' + next + '"]')
+        if (currentRow) {
+          currentRow.classList.add('asmr-lyrics-line--active')
+          if (scrollIntoView && state.open) {
+            centerLine(currentRow)
+          }
+        }
+      }
       commitCurrentLyric()
       return
     }
@@ -443,7 +469,7 @@
       if (row) {
         row.classList.add('asmr-lyrics-line--active')
         if (scrollIntoView && state.open) {
-          row.scrollIntoView({ block: 'center', behavior: 'smooth' })
+          centerLine(row)
         }
       }
     }
@@ -481,6 +507,38 @@
       .catch(function () { return clean })
   }
 
+  function loadSelectedSubtitle (hash) {
+    var selected = state.subtitles.find(function (item) { return item.hash === hash })
+    if (!hash || hash === state.subtitleHash) return
+    var myToken = ++state.loadToken
+    state.subtitleHash = hash
+    state.subtitleTitle = (selected && selected.title) || ''
+    state.lines = []
+    state.activeIndex = -1
+    state.loading = true
+    renderLines()
+    freshFetch('/api/media/stream/' + hash + tokenQuery())
+      .then(function (res) {
+        if (!res.ok) throw new Error(res.status + ' ' + res.statusText)
+        return res.text()
+      })
+      .then(function (text) {
+        if (myToken !== state.loadToken) return
+        state.loading = false
+        state.lines = parseLrc(text)
+        renderLines()
+        commitCurrentLyric()
+      })
+      .catch(function (err) {
+        if (myToken !== state.loadToken) return
+        state.loading = false
+        state.lines = []
+        console.warn('ASMR selected subtitle failed:', err)
+        renderLines()
+        commitCurrentLyric()
+      })
+  }
+
   function loadTrackMeta (hash, track, token) {
     if (currentWorkId(track, hash)) return Promise.resolve(track || {})
     return freshFetch('/api/track/' + encodeURIComponent(hash) + token)
@@ -498,6 +556,7 @@
     state.workId = currentWorkId(track, hash)
     state.subtitleHash = ''
     state.subtitleTitle = ''
+    state.subtitles = []
     state.lines = []
     state.activeIndex = -1
     state.offset = loadOffset()
@@ -527,12 +586,17 @@
         if (myToken !== state.loadToken) return null
         if (!check || !check.result || !check.hash) return { missing: true }
         state.subtitleHash = check.hash
+        state.subtitles = Array.isArray(check.subtitles) && check.subtitles.length
+          ? check.subtitles
+          : [{ hash: check.hash, title: '' }]
+        var selected = state.subtitles.find(function (item) { return item.hash === check.hash })
+        if (selected) state.subtitleTitle = selected.title || ''
         return Promise.all([
           freshFetch('/api/media/stream/' + check.hash + token).then(function (res) {
             if (!res.ok) throw new Error(res.status + ' ' + res.statusText)
             return res.text()
           }),
-          loadSubtitleTitle(check.hash, token)
+          state.subtitleTitle ? Promise.resolve(state.subtitleTitle) : loadSubtitleTitle(check.hash, token)
         ])
       })
       .then(function (result) {
@@ -800,6 +864,7 @@
         hash: state.hash,
         workId: state.workId,
         subtitleHash: state.subtitleHash,
+        subtitles: state.subtitles.slice(),
         lines: state.lines.length,
         activeIndex: state.activeIndex,
         offset: state.offset

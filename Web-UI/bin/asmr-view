@@ -415,24 +415,6 @@ def close_read_db() -> None:
         _state.db = None
 
 
-def get_token() -> str | None:
-    if not CONFIG_PATH.exists():
-        return None
-    try:
-        return json.loads(CONFIG_PATH.read_text()).get("token")
-    except Exception:
-        return None
-
-
-def get_neo_port() -> int:
-    if CONFIG_PATH.is_file():
-        try:
-            return int(json.loads(CONFIG_PATH.read_text()).get("port", 8889))
-        except Exception:
-            pass
-    return 8889
-
-
 def get_admin_credentials() -> tuple[str, str]:
     cfg = {}
     if CONFIG_PATH.is_file():
@@ -1128,6 +1110,12 @@ class AsmrViewHandler(BaseHTTPRequestHandler):
                 if not self._require_dashboard_admin(allow_loopback=False):
                     return
                 self._admin_reindex()
+            elif path == "/api/admin/refresh-cache":
+                if not self._require_dashboard_admin(allow_loopback=False):
+                    return
+                close_read_db()
+                build_cover_cache()
+                self._json({"ok": True, "works": self._count_works(), "covers": len(_COVER_CACHE)})
             elif path.startswith("/api/review"):
                 self._kikoeru_review_post(path, body)
             elif path.startswith("/api/mylist"):
@@ -1732,58 +1720,7 @@ class AsmrViewHandler(BaseHTTPRequestHandler):
                 return
             self._serve_file_range(real, head=False)
             return
-        # Fallback: Neokikoeru proxy
-        token = get_token()
-        if not token:
-            self._json({"error": f"file missing on disk and no neo token ({real} not found)"}, 503)
-            return
-        port = get_neo_port()
-        upstream = (
-            f"http://127.0.0.1:{port}/api/v1/fs/download"
-            f"?file_id={urllib.parse.quote(file_id)}&token={urllib.parse.quote(token)}"
-        )
-        fwd_headers = {"User-Agent": "asmr-view/1.0"}
-        rng = self.headers.get("Range")
-        if rng:
-            fwd_headers["Range"] = rng
-        try:
-            req = urllib.request.Request(upstream, headers=fwd_headers)
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                status = resp.status
-                ctype = resp.headers.get("Content-Type", "application/octet-stream")
-                clen = resp.headers.get("Content-Length")
-                crange = resp.headers.get("Content-Range")
-                suffix = Path(row["name"] or "").suffix.lower()
-                if status == 200 and suffix in (".lrc", ".vtt", ".srt", ".ass", ".ssa"):
-                    raw = resp.read()
-                    self._serve_subtitle_bytes_as_lrc(raw, suffix)
-                    return
-                self.send_response(status)
-                self.send_header("Content-Type", ctype)
-                if clen:
-                    self.send_header("Content-Length", clen)
-                if crange:
-                    self.send_header("Content-Range", crange)
-                self.send_header("Accept-Ranges", "bytes")
-                self.send_header("Cache-Control", "public, max-age=3600")
-                self.end_headers()
-                while True:
-                    chunk = resp.read(64 * 1024)
-                    if not chunk:
-                        break
-                    self.wfile.write(chunk)
-        except urllib.error.HTTPError as he:
-            try:
-                err_body = he.read()
-            except Exception:
-                err_body = b""
-            self.send_response(he.code)
-            self.send_header("Content-Type", "application/octet-stream")
-            self.send_header("Content-Length", str(len(err_body)))
-            self.end_headers()
-            self.wfile.write(err_body)
-        except Exception as e:
-            self._json({"error": f"upstream failed: {e}"}, 502)
+        self._json({"error": f"indexed file is missing on disk: {real}"}, 404)
 
     def _api_duration(self, file_id: str):
         conn = get_db()
@@ -2035,61 +1972,7 @@ class AsmrViewHandler(BaseHTTPRequestHandler):
             # Regular audio: stream with Range support.
             self._serve_file_range(real, content_type=None, head=head)
             return
-        # Fallback: proxy via Neokikoeru
-        token = get_token()
-        if not token:
-            self._json({"error": f"file missing on disk and no neo token ({real} not found)"}, 503)
-            return
-        port = get_neo_port()
-        upstream = (
-            f"http://127.0.0.1:{port}/api/v1/fs/download"
-            f"?file_id={urllib.parse.quote(file_hash)}&token={urllib.parse.quote(token)}"
-        )
-        fwd_headers = {"User-Agent": "asmr-view/1.0"}
-        rng = self.headers.get("Range")
-        if rng:
-            fwd_headers["Range"] = rng
-        try:
-            req = urllib.request.Request(upstream, headers=fwd_headers)
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                status = resp.status  # 200 or 206
-                ctype = resp.headers.get("Content-Type", "application/octet-stream")
-                clen = resp.headers.get("Content-Length")
-                crange = resp.headers.get("Content-Range")
-                accept_ranges = resp.headers.get("Accept-Ranges", "bytes")
-                suffix = Path(row["name"] or "").suffix.lower()
-                if status == 200 and suffix in (".lrc", ".vtt", ".srt", ".ass", ".ssa"):
-                    raw = resp.read()
-                    self._serve_subtitle_bytes_as_lrc(raw, suffix, head=head)
-                    return
-                self.send_response(status)
-                self.send_header("Content-Type", ctype)
-                if clen:
-                    self.send_header("Content-Length", clen)
-                if crange:
-                    self.send_header("Content-Range", crange)
-                self.send_header("Accept-Ranges", accept_ranges)
-                self.send_header("Cache-Control", "public, max-age=3600")
-                self.end_headers()
-                if not head:
-                    while True:
-                        chunk = resp.read(64 * 1024)
-                        if not chunk:
-                            break
-                        self.wfile.write(chunk)
-        except urllib.error.HTTPError as he:
-            try:
-                err_body = he.read()
-            except Exception:
-                err_body = b""
-            self.send_response(he.code)
-            self.send_header("Content-Type", "application/octet-stream")
-            self.send_header("Content-Length", str(len(err_body)))
-            self.end_headers()
-            if not head:
-                self.wfile.write(err_body)
-        except Exception as e:
-            self._json({"error": f"upstream failed: {e}"}, 502)
+        self._json({"error": f"indexed file is missing on disk: {real}"}, 404, head=head)
 
     def _serve_file_range(self, path: Path, content_type: str | None = None,
                             head: bool = False, attachment_name: str | None = None):
@@ -2196,40 +2079,7 @@ class AsmrViewHandler(BaseHTTPRequestHandler):
         if real.is_file():
             self._serve_file_range(real, head=head, attachment_name=row["name"])
             return
-        # Fallback: Neokikoeru
-        token = get_token()
-        if not token:
-            self._json({"error": f"file missing on disk and no neo token ({real} not found)"}, 503)
-            return
-        port = get_neo_port()
-        upstream = (
-            f"http://127.0.0.1:{port}/api/v1/fs/download"
-            f"?file_id={urllib.parse.quote(file_hash)}&token={urllib.parse.quote(token)}"
-        )
-        try:
-            req = urllib.request.Request(upstream, headers={"User-Agent": "asmr-view/1.0"})
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                ctype = resp.headers.get("Content-Type", "application/octet-stream")
-                clen = resp.headers.get("Content-Length")
-                filename = row["name"]
-                encoded = urllib.parse.quote(filename, safe="")
-                self.send_response(HTTPStatus.OK)
-                self.send_header("Content-Type", ctype)
-                if clen:
-                    self.send_header("Content-Length", clen)
-                self.send_header(
-                    "Content-Disposition",
-                    f"attachment; filename=\"download\"; filename*=UTF-8''{encoded}",
-                )
-                self.end_headers()
-                if not head:
-                    while True:
-                        chunk = resp.read(64 * 1024)
-                        if not chunk:
-                            break
-                        self.wfile.write(chunk)
-        except Exception as e:
-            self._json({"error": f"upstream failed: {e}"}, 502)
+        self._json({"error": f"indexed file is missing on disk: {real}"}, 404, head=head)
 
     def _kikoeru_cover(self, raw_id: str, head: bool = False):
         # accept both numeric and "RJ..." forms
@@ -2264,11 +2114,16 @@ class AsmrViewHandler(BaseHTTPRequestHandler):
         if row is None:
             self._json({"result": False, "hash": None})
             return
-        lrc_hash = _kikoeru.find_lrc_for_audio(conn, row["work_id"], audio_hash)
+        subtitles = _kikoeru.list_subtitles_for_audio(conn, row["work_id"], audio_hash)
+        lrc_hash = subtitles[0]["hash"] if subtitles else None
+        choices = [
+            {"hash": f"{item['hash']}@lrc", "title": item["title"]}
+            for item in subtitles
+        ]
         if lrc_hash:
-            self._json({"result": True, "hash": f"{lrc_hash}@lrc"})
+            self._json({"result": True, "hash": f"{lrc_hash}@lrc", "subtitles": choices})
         else:
-            self._json({"result": False, "hash": None})
+            self._json({"result": False, "hash": None, "subtitles": []})
 
     def _kikoeru_track(self, file_hash: str):
         """Single file metadata — kikoeru uses this for queue items."""

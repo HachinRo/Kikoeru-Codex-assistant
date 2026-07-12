@@ -17,59 +17,79 @@
   <link href="/css/app.88bd61a4.css" rel="stylesheet">
   <style>
     #asmr-index-refresh {
-      position: fixed;
-      right: 18px;
-      top: 58px;
-      z-index: 99999;
-      width: 40px;
-      height: 40px;
+      width: 100%;
+      min-height: 48px;
       border: 0;
-      border-radius: 50%;
-      background: #1976d2;
-      color: #fff;
-      box-shadow: 0 2px 7px rgba(0,0,0,.35);
+      background: transparent;
+      color: inherit;
       cursor: pointer;
-      font-size: 22px;
-      line-height: 40px;
+      font: inherit;
+      text-align: left;
     }
     #asmr-index-refresh[disabled] {
       opacity: .65;
       cursor: wait;
     }
     #asmr-library-dashboard-link {
-      position: fixed;
-      right: 18px;
-      top: 106px;
-      z-index: 99999;
-      width: 40px;
-      height: 40px;
-      border-radius: 50%;
-      background: #009688;
-      color: #fff;
-      box-shadow: 0 2px 7px rgba(0,0,0,.35);
+      width: 100%;
+      min-height: 48px;
+      color: inherit;
       cursor: pointer;
-      font-size: 20px;
-      line-height: 40px;
-      text-align: center;
       text-decoration: none;
     }
+    .asmr-sidebar-action {
+      box-sizing: border-box;
+    }
+    .asmr-sidebar-action .q-item__section--avatar {
+      min-width: 56px;
+    }
+    .asmr-sidebar-separator {
+      height: 1px;
+      margin: 8px 0;
+      background: rgba(0,0,0,.12);
+    }
+    #asmr-work-refresh,
     #asmr-work-delete {
-      position: fixed;
-      right: 18px;
-      top: 154px;
-      z-index: 99999;
-      width: 40px;
-      height: 40px;
+      display: inline-flex;
+      width: 30px;
+      height: 30px;
+      margin-left: 8px;
       border: 0;
       border-radius: 50%;
-      background: #c10015;
-      color: #fff;
-      box-shadow: 0 2px 7px rgba(0,0,0,.35);
+      background: transparent;
       cursor: pointer;
-      display: flex;
       align-items: center;
       justify-content: center;
+      vertical-align: middle;
+      transition: background-color .15s ease;
     }
+    #asmr-work-refresh {
+      color: #1976d2;
+    }
+    #asmr-work-delete {
+      color: #c10015;
+    }
+    #asmr-work-refresh:hover,
+    #asmr-work-refresh:focus-visible {
+      background: rgba(25,118,210,.1);
+      outline: none;
+    }
+    #asmr-work-delete:hover,
+    #asmr-work-delete:focus-visible {
+      background: rgba(193,0,21,.1);
+      outline: none;
+    }
+    #asmr-work-refresh .material-icons,
+    #asmr-work-delete .material-icons {
+      font-size: 18px;
+    }
+    #asmr-work-refresh[aria-busy="true"] .material-icons {
+      animation: asmr-refresh-spin .8s linear infinite;
+    }
+    @keyframes asmr-refresh-spin {
+      to { transform: rotate(360deg); }
+    }
+    #asmr-work-refresh[disabled],
     #asmr-work-delete[disabled] {
       opacity: .65;
       cursor: wait;
@@ -164,16 +184,49 @@
     </noscript>
     <!-- DO NOT touch the following DIV -->
     <div id="q-app"></div>
-    <button id="asmr-index-refresh" title="Refresh ASMR index and cover metadata">↻</button>
-    <a id="asmr-library-dashboard-link" title="ASMR library dashboard" href="/asmr-library">☷</a>
+    <button id="asmr-index-refresh" title="刷新媒体库" aria-label="刷新媒体库"></button>
+    <a id="asmr-library-dashboard-link" title="管理面板" aria-label="管理面板" href="/asmr-library"></a>
     <script>
       (function () {
+        if (window.location.pathname.replace(/\/$/, '') === '/favourites/folder') {
+          window.history.replaceState(null, '', '/favourites')
+        }
         var btn = document.getElementById('asmr-index-refresh')
         if (!btn) return
-        function currentWorkRj () {
-          var m = window.location.pathname.match(/^\/work\/(RJ\d+)/i)
-          return m ? m[1].toUpperCase() : ''
+        var dashboard = document.getElementById('asmr-library-dashboard-link')
+        function sidebarActionContent (icon, label) {
+          return '<div tabindex="-1" class="q-focus-helper"></div>' +
+            '<div class="q-item__section column q-item__section--avatar q-item__section--side justify-center">' +
+              '<i aria-hidden="true" role="presentation" class="q-icon notranslate material-icons">' + icon + '</i>' +
+            '</div>' +
+            '<div class="q-item__section column q-item__section--main justify-center">' +
+              '<div class="q-item__label text-subtitle1">' + label + '</div>' +
+            '</div>'
         }
+        function installSidebarActions () {
+          var list = document.querySelector('.q-drawer .q-list')
+          if (!list || btn.parentNode === list) return
+          var separator = document.getElementById('asmr-sidebar-separator')
+          if (!separator) {
+            separator = document.createElement('div')
+            separator.id = 'asmr-sidebar-separator'
+            separator.className = 'asmr-sidebar-separator'
+            list.appendChild(separator)
+          }
+          btn.className = 'asmr-sidebar-action q-item q-item-type row no-wrap q-item--clickable q-link cursor-pointer q-focusable q-hoverable'
+          btn.setAttribute('role', 'listitem')
+          btn.innerHTML = sidebarActionContent('refresh', '刷新媒体库')
+          list.appendChild(btn)
+          if (dashboard) {
+            dashboard.className = 'asmr-sidebar-action q-item q-item-type row no-wrap q-item--clickable q-link cursor-pointer q-focusable q-hoverable'
+            dashboard.setAttribute('role', 'listitem')
+            dashboard.innerHTML = sidebarActionContent('dashboard', '管理面板')
+            list.appendChild(dashboard)
+          }
+        }
+        new MutationObserver(installSidebarActions).observe(document.body, { childList: true, subtree: true })
+        window.addEventListener('load', installSidebarActions)
+        installSidebarActions()
         function jsonFetch (path, opts) {
           return fetch(path, opts).then(function (r) {
             return r.json().then(function (j) {
@@ -196,53 +249,52 @@
             poll()
           })
         }
-function runWorkRefresh (rj) {
- return jsonFetch('/api/asmr-library/actions/fix-content', {
- method: 'POST',
- headers: {'Content-Type': 'application/json'},
- body: JSON.stringify({rj: rj})
- }).then(function (action) {
-   return waitAction(action.id)
- }).then(function () {
-   return jsonFetch('/api/admin/reindex', { method: 'POST' }).catch(function (err) {
-    console.warn('ASMR global reindex skipped after work refresh:', err)
-    return { ok: false, skipped: true, error: String(err && err.message || err) }
- })
- })
+ function dashboardAuthHeader () {
+ try { return window.sessionStorage.getItem('asmrAdminBasicAuth') || '' } catch (err) { return '' }
  }
  function runIndexRefresh () {
+ var auth = dashboardAuthHeader()
+ if (!auth) return Promise.reject(new Error('admin credentials required'))
  return jsonFetch('/api/asmr-library/actions/reindex', {
  method: 'POST',
- headers: {'Content-Type': 'application/json'},
+ headers: {'Content-Type': 'application/json', 'Authorization': auth, 'X-ASMR-Dashboard-Request': '1'},
  body: JSON.stringify({})
  }).then(function (action) {
  return waitAction(action.id)
+ }).then(function () {
+ return jsonFetch('/api/admin/refresh-cache', {
+ method: 'POST',
+ headers: {'Content-Type': 'application/json', 'Authorization': auth, 'X-ASMR-Dashboard-Request': '1'},
+ body: JSON.stringify({})
+ })
  })
  }
  btn.addEventListener('click', function () {
- var old = btn.textContent
- var rj = currentWorkRj()
+ var old = btn.innerHTML
  btn.disabled = true
- btn.textContent = '…'
- var work = rj ? runWorkRefresh(rj) : runIndexRefresh()
-          work.then(function (res) {
-              btn.textContent = '✓'
-              console.log(rj ? 'ASMR work refresh result:' : 'ASMR index refresh result:', res)
+ btn.setAttribute('aria-busy', 'true')
+          runIndexRefresh().then(function (res) {
+              console.log('ASMR library scan result:', res)
               setTimeout(function () {
-                btn.textContent = old
+                btn.innerHTML = old
                 btn.disabled = false
-                if (rj) window.location.reload()
+                btn.removeAttribute('aria-busy')
+                window.location.reload()
               }, 900)
             })
             .catch(function (err) {
-              btn.textContent = '!'
               console.error('ASMR refresh failed:', err)
-              setTimeout(function () { btn.textContent = old; btn.disabled = false }, 2200)
+              if (/admin credentials/i.test(String(err && err.message || err))) {
+                window.alert('请先在管理面板保存管理员登录信息，然后再刷新媒体库。')
+                window.location.href = '/asmr-library'
+                return
+              }
+              setTimeout(function () { btn.innerHTML = old; btn.disabled = false; btn.removeAttribute('aria-busy') }, 2200)
             })
         })
       }())
     </script>
-    <script type="text/javascript" src="/js/asmr-work-delete.js"></script>
+    <script type="text/javascript" src="/js/asmr-work-delete.js?v=refresh5"></script>
     <script>
       (function () {
         var current = ''
@@ -301,5 +353,5 @@ function runWorkRefresh (rj) {
         syncCover()
       }())
     </script>
-  <script type="text/javascript" src="/js/app.051b603f.fix10.js"></script><script type="text/javascript" src="/js/runtime.3597b51d.js"></script><script type="text/javascript" src="/js/vendor.86022408.js"></script><script type="text/javascript" src="/js/asmr-player-work-detail.js?v=fix11"></script><script type="text/javascript" src="/js/asmr-video-viewer.js?v=fix10"></script><script type="text/javascript" src="/js/asmr-lyrics-panel.js?v=fix12"></script></body>
+  <script type="text/javascript" src="/js/app.051b603f.fix11.js"></script><script type="text/javascript" src="/js/runtime.3597b51d.js"></script><script type="text/javascript" src="/js/vendor.86022408.js"></script><script type="text/javascript" src="/js/asmr-player-work-detail.js?v=fix11"></script><script type="text/javascript" src="/js/asmr-video-viewer.js?v=fix10"></script><script type="text/javascript" src="/js/asmr-lyrics-panel.js?v=fix15"></script></body>
 </html>

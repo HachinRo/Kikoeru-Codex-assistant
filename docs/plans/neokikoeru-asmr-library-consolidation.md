@@ -1,4 +1,8 @@
-# Consolidate Neokikoeru into ASMR-Library Workflow
+# Consolidate Neokikoeru into ASMR-Library Workflow (Archived)
+
+> Historical document only. The separate NeoKikoeru HTTP worker, port 8889,
+> service wrapper, and proxy fallbacks have been retired. The live stack uses
+> the native indexer and the single viewer/operator service on port 8890.
 
 > **For Hermes:** Plan only — no execution in this turn. Hand to subagent-driven-development when ready.
 > **Updated 2026-06-22 12:24** after verifying the actual Neokikoeru 3.7.1 binary, docs site, and front-end API callsite.

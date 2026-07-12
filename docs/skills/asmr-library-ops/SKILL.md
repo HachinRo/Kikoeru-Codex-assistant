@@ -1,6 +1,6 @@
 ---
 name: asmr-library-ops
-description: Operate, debug, repair, and extend a local ASMR-library/Kikoeru/NeoKikoeru media stack. Use when working on ASMR-library UI/features, Kikoeru-compatible search/tag/grouping routes, subtitle fetching or .vtt/.lrc encoding issues, RJ work lookup problems, NeoKikoeru indexing, local services on ports 8889/8890, or the ASMR pipeline under <ASMR_STACK_ROOT>.
+description: Operate, debug, repair, and extend the consolidated local ASMR-library/Kikoeru stack. Use when working on ASMR-library UI/features, Kikoeru-compatible search/tag/grouping routes, subtitle fetching or .vtt/.lrc encoding issues, RJ work lookup problems, native indexing, the single service on port 8890, or the ASMR pipeline under <ASMR_STACK_ROOT>.
 ---
 
 # ASMR Library Ops
@@ -19,7 +19,7 @@ Primary paths and ports:
 - Integrated ASMR dashboard: `http://127.0.0.1:8890/asmr-library`
 - Port `8890` intentionally binds to `0.0.0.0` for trusted-LAN playback. Preserve that behavior unless the user asks to change it. Maintenance and media-mutating dashboard actions still require admin credentials.
 - Do not start standalone dashboard on `8891`; `asmr-library dashboard` should point to the integrated dashboard.
-- NeoKikoeru maintenance service may be started temporarily by build/reindex, but should not remain a normal listening web port.
+- Indexing and deep builds run natively without starting a secondary media worker or listener.
 - ASMR media root: `<ASMR_MEDIA_ROOT>`
 - NeoKikoeru DB: `<NEOKIKOERU_DB>`
 - Local reference repos: `refs/ASMR-Kikoeru` (`https://github.com/HachinRo/ASMR-Kikoeru`), `refs/kikoeru-express`, `refs/asmr-downloader`, `refs/neokikoeru`
@@ -58,7 +58,7 @@ Use the local CLI for a quick metadata/cover reindex. The HTTP admin route is au
 "<ASMR_STACK_ROOT>/bin/asmr-library" reindex
 ```
 
-For a deeper NeoKikoeru/import refresh, use:
+For a full native file-row rebuild, use:
 
 ```bash
 "<ASMR_STACK_ROOT>/bin/asmr-library" build

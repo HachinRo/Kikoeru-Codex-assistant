@@ -25,7 +25,6 @@ DEFAULT_STATE_ROOT = Path(__file__).resolve().parent.parent
 STATE_ROOT = Path(os.environ.get("ASMR_STATE_ROOT") or os.environ.get("ASMR_STACK_ROOT") or DEFAULT_STATE_ROOT)
 ASMR_LIBRARY = STATE_ROOT / "bin" / "asmr-library"
 ASMR_VIEW = STATE_ROOT / "bin" / "asmr-view"
-NEOKIKOERU_SERVE = STATE_ROOT / "bin" / "neokikoeru-serve"
 DEFAULT_MEDIA_ROOT = Path("/Volumes/TOSHIBA/AMSR")
 LIBRARY_ROOT = Path(os.environ.get("ASMR_LIBRARY_ROOT") or os.environ.get("ASMR_MEDIA_ROOT") or DEFAULT_MEDIA_ROOT)
 VOLUME_ROOT = Path(os.environ.get("ASMR_VOLUME_ROOT") or LIBRARY_ROOT.parent)

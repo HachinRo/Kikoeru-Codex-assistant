@@ -9,8 +9,8 @@ Use this file when diagnosing ASMR-library/Kikoeru/NeoKikoeru failures, routing 
 | Main viewer | `http://127.0.0.1:8890` | Kikoeru-compatible frontend and API served by `asmr-view`. It intentionally binds to the trusted LAN; maintenance mutations require admin credentials. |
 | Integrated dashboard | `http://127.0.0.1:8890/asmr-library` | Namespaced ASMR-library UI inside the main viewer. |
 | Standalone dashboard | retired | Do not use a separate `8891` dashboard; use `/asmr-library` on `8890`. |
-| NeoKikoeru maintenance | on-demand internal service | May be started temporarily by build/reindex, but should not be left as a persistent browser/admin port. |
-| ASMR commands | `<ASMR_STACK_ROOT>/bin` | `asmr-view`, `asmr-library`, `asmr-subs`, `asmr-neo`, `neokikoeru-serve`. |
+| Native indexer | in-process/CLI worker | `reindex` and deep `build` update the existing SQLite index directly and open no additional port. |
+| ASMR commands | `<ASMR_STACK_ROOT>/bin` | `asmr-view`, `asmr-library`, `asmr-subs`, `asmr-neo`, `asmr-native-scan`. |
 | ASMR library code | `<ASMR_STACK_ROOT>/lib` | Includes `asmr_view_kikoeru.py`, the main viewer backend. |
 | Kikoeru SPA | `<ASMR_STACK_ROOT>/kikoeru-spa` | Compiled frontend bundle; patches are brittle. |
 | Media root | `<ASMR_MEDIA_ROOT>` | Do not bulk-mutate media casually. |
@@ -23,7 +23,7 @@ Use this file when diagnosing ASMR-library/Kikoeru/NeoKikoeru failures, routing 
 - `<ASMR_STACK_ROOT>/bin/asmr-library`: umbrella CLI for build, dashboard, works, and subtitles.
 - `<ASMR_STACK_ROOT>/bin/asmr-subs`: subtitle download/refetch/encoding CLI.
 - `<ASMR_STACK_ROOT>/bin/asmr-neo`: work/file lookup CLI now expected to use viewer API/stream routes on `8890`.
-- `<ASMR_STACK_ROOT>/bin/neokikoeru-serve`: NeoKikoeru adapter; previously had a float progress formatting crash in tasks output.
+- `<ASMR_STACK_ROOT>/bin/asmr-native-scan`: reconciles works, metadata, covers, and file rows without a secondary service.
 - `<ASMR_STACK_ROOT>/lib/asmr_view_kikoeru.py`: Kikoeru-compatible routes, media streaming, search, grouping.
 - `<ASMR_STACK_ROOT>/kikoeru-spa/js/app.051b603f.fix10.js`: active patched SPA bundle.
 - `<ASMR_STACK_ROOT>/kikoeru-spa/index.html`: points the frontend to the patched bundle.
