@@ -170,6 +170,14 @@ has_partial_files() {
     [ -n "${found}" ]
 }
 
+downloader_reported_failure() {
+    log_path="$1"
+    start_bytes="$2"
+    first_byte=$((start_bytes + 1))
+    tail -c "+${first_byte}" "${log_path}" 2>/dev/null |
+        grep -E '❌.*(失败|[Ff]ail(ed|ure)?|[Ee]rror)' >/dev/null 2>&1
+}
+
 validate_payload() {
     payload="$1"
     has_nonempty_audio "${payload}" ||
@@ -390,6 +398,7 @@ run_fill() {
         printf 'fill_stage=%s\n' "${fill_stage}"
         printf 'final=%s\n' "${final_path}"
     } >>"${log_path}"
+    log_start_bytes="$(wc -c <"${log_path}" | tr -d '[:space:]')"
 
     set +e
     (
@@ -401,6 +410,10 @@ run_fill() {
 
     if [ "${downloader_status}" -ne 0 ]; then
         warn "${rj} asmroner exited with status ${downloader_status}; fill_stage preserved for inspection: ${fill_stage}"
+        return 1
+    fi
+    if downloader_reported_failure "${log_path}" "${log_start_bytes}"; then
+        warn "${rj} asmroner reported failed files despite exit status 0; fill_stage preserved for retry: ${fill_stage}"
         return 1
     fi
 
@@ -516,6 +529,7 @@ run_download() {
         printf '\n=== %s %s %s ===\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "${mode}" "${rj}"
         printf 'staging=%s\n' "${stage_path}"
     } >>"${log_path}"
+    log_start_bytes="$(wc -c <"${log_path}" | tr -d '[:space:]')"
 
     set +e
     (
@@ -527,6 +541,9 @@ run_download() {
 
     if [ "${downloader_status}" -ne 0 ]; then
         fail "${rj} downloader exited with status ${downloader_status}; staging preserved; log ${log_path}"
+    fi
+    if downloader_reported_failure "${log_path}" "${log_start_bytes}"; then
+        fail "${rj} downloader reported failed files despite exit status 0; staging preserved; log ${log_path}"
     fi
 
     payload="$(find_payload "${stage_path}" "${rj}" 2>/dev/null || true)"
