@@ -176,7 +176,7 @@ def _existing_relative_files(root: Path, rj: str) -> set[str]:
         return set()
     base = root
     children = [p for p in root.iterdir() if p.is_dir()] if root.exists() else []
-    if root.name == f"{rj}.partial" and len(children) == 1:
+    if root.name in {f"{rj}.partial", f"{rj}.fill"} and len(children) == 1:
         base = children[0]
     out: set[str] = set()
     for p in base.rglob("*"):
@@ -258,18 +258,23 @@ def _work_progress(rj: str, status: str = "running") -> dict:
     expected_rel = {str(_relative_db_path(rj, f["path"])) for f in expected_files}
 
     final_root = LIBRARY_ROOT / rj
-    stage_root = LIBRARY_ROOT.parent / "AMSR.incoming" / f"{rj}.partial"
+    partial_root = STAGING_ROOT / f"{rj}.partial"
+    fill_root = STAGING_ROOT / f"{rj}.fill"
     final_files = _existing_relative_files(final_root, rj)
-    stage_files = _existing_relative_files(stage_root, rj)
+    stage_files = (
+        _existing_relative_files(partial_root, rj)
+        | _existing_relative_files(fill_root, rj)
+    )
     existing_rel = final_files | stage_files
 
-    if info.get("folder_exists") and existing_rel:
+    expected_track_files = _expected_file_count_from_tracks_api(rj)
+    if expected_track_files:
         missing = []
-        downloaded = len(existing_rel)
-        total = len(existing_rel)
-        expected_source = "work-files"
+        downloaded = min(len(existing_rel), expected_track_files)
+        total = expected_track_files
+        expected_source = "tracks-api"
         count_unit = "files"
-        missing_count = 0
+        missing_count = max(total - downloaded, 0)
     elif expected_rel:
         missing = sorted(expected_rel - existing_rel)
         downloaded = len(expected_rel) - len(missing)
@@ -278,15 +283,7 @@ def _work_progress(rj: str, status: str = "running") -> dict:
         count_unit = "files"
         missing_count = len(missing)
     else:
-        expected_track_files = _expected_file_count_from_tracks_api(rj)
-        if expected_track_files:
-            missing = []
-            downloaded = min(len(existing_rel), expected_track_files)
-            total = expected_track_files
-            expected_source = "tracks-api"
-            count_unit = "files"
-            missing_count = max(total - downloaded, 0)
-        elif existing_rel:
+        if existing_rel:
             missing = []
             downloaded = len(existing_rel)
             total = len(existing_rel)
@@ -309,9 +306,7 @@ def _work_progress(rj: str, status: str = "running") -> dict:
                 count_unit = "files"
                 missing_count = None
 
-    if info.get("folder_exists") and existing_rel:
-        percent = 100
-    elif total:
+    if total:
         percent = round(downloaded * 100 / total)
         if status == "running" and percent >= 100:
             percent = 99
