@@ -4,6 +4,7 @@ import sqlite3
 import subprocess
 import tempfile
 import unittest
+from contextlib import closing
 from pathlib import Path
 from unittest import mock
 
@@ -49,9 +50,10 @@ class OperationalScriptTests(unittest.TestCase):
             media = work / "track.mp3"
             media.write_bytes(b"audio")
             db_path = base / "neo.db"
-            with sqlite3.connect(db_path) as db:
+            with closing(sqlite3.connect(db_path)) as db:
                 db.execute("CREATE TABLE files(path TEXT, size INTEGER, work_id TEXT, is_folder INTEGER)")
                 db.execute("INSERT INTO files VALUES(?, ?, ?, 0)", ("/RJ00000001/track.mp3", 5, "RJ00000001"))
+                db.commit()
             env["NEOKIKOERU_DB"] = str(db_path)
             result = subprocess.run([str(worker), "status", "RJ00000001"], env=env, text=True, capture_output=True)
             self.assertEqual(result.returncode, 0)
