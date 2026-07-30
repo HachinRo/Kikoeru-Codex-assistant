@@ -14,6 +14,7 @@ kikoeru = load_script(
 class LyricsSubtitleChoiceTests(unittest.TestCase):
     def test_lists_best_match_then_other_subtitles(self):
         conn = sqlite3.connect(":memory:")
+        self.addCleanup(conn.close)
         conn.row_factory = sqlite3.Row
         conn.execute(
             "CREATE TABLE files(id TEXT, name TEXT, parent_id TEXT, work_id TEXT, is_folder INTEGER, path TEXT)"

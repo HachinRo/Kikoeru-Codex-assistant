@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import fcntl
 import hmac
 import json
 import importlib.util
@@ -67,6 +68,7 @@ VIEW_DIR = STATE_ROOT / "view"
 KIKOERU_SPA_DIR = STATE_ROOT / "kikoeru-spa"
 LOG_PATH = STATE_ROOT / "asmr-view.log"
 PID_PATH = STATE_ROOT / "asmr-view.pid"
+START_LOCK_PATH = STATE_ROOT / "locks" / "asmr-view-start.lock"
 
 NEOKIKOERU_DATA = Path(
     os.environ.get("NEOKIKOERU_DATA_ROOT")
@@ -1074,30 +1076,37 @@ class AsmrViewHandler(BaseHTTPRequestHandler):
                 if name in PROTECTED_DASHBOARD_ACTIONS and not self._require_dashboard_admin(allow_loopback=False):
                     return
                 try:
-                    payload = json.loads(body.decode("utf-8")) if body else {}
-                except json.JSONDecodeError:
-                    payload = {}
-                if name == "fix-covers":
-                    sample_rj = dash.rj_arg(payload.get("rj", "RJ01580504") or "RJ01580504")
-                    rec = dash.queue_action("fix-covers", [str(STATE_ROOT / "bin" / "asmr-fix-covers-workflow"), sample_rj], timeout=1800)
-                elif name == "reindex":
-                    rec = dash.queue_action("reindex", [str(STATE_ROOT / "bin" / "asmr-library"), "reindex"], timeout=1800)
-                elif name == "subs-search":
-                    rec = dash.queue_action("subs-search", [str(STATE_ROOT / "bin" / "asmr-library"), "subs", "search-missing"], timeout=3600)
-                else:
-                    rj = dash.rj_arg(payload.get("rj", ""))
-                    mapping = {
-                        "download": [str(STATE_ROOT / "bin" / "asmr-library"), "download", rj],
-                        "retry": [str(STATE_ROOT / "bin" / "asmr-library"), "retry", rj],
-                        "fill": [str(STATE_ROOT / "bin" / "asmr-library"), "fill", rj],
-                        "fix-content": [str(STATE_ROOT / "bin" / "asmr-fix-content-workflow"), rj],
-                        "subs-dry-run": [str(STATE_ROOT / "bin" / "asmr-library"), "subs", "fetch", rj, "--dry-run"],
-                        "subs-fetch": [str(STATE_ROOT / "bin" / "asmr-library"), "subs", "fetch", rj],
-                    }
-                    if name not in mapping:
-                        self._json({"error": "unknown action"}, 404)
-                        return
-                    rec = dash.queue_action(name, mapping[name], timeout=1800)
+                    try:
+                        payload = json.loads(body.decode("utf-8")) if body else {}
+                    except json.JSONDecodeError:
+                        payload = {}
+                    if name == "fix-covers":
+                        sample_rj = dash.rj_arg(payload.get("rj", "RJ01580504") or "RJ01580504")
+                        rec = dash.queue_action("fix-covers", [str(STATE_ROOT / "bin" / "asmr-fix-covers-workflow"), sample_rj], timeout=1800)
+                    elif name == "reindex":
+                        rec = dash.queue_action("reindex", [str(STATE_ROOT / "bin" / "asmr-library"), "reindex"], timeout=1800)
+                    elif name == "subs-search":
+                        rec = dash.queue_action("subs-search", [str(STATE_ROOT / "bin" / "asmr-library"), "subs", "search-missing"], timeout=3600)
+                    else:
+                        rj = dash.rj_arg(payload.get("rj", ""))
+                        mapping = {
+                            "download": [str(STATE_ROOT / "bin" / "asmr-library"), "download", rj],
+                            "retry": [str(STATE_ROOT / "bin" / "asmr-library"), "retry", rj],
+                            "fill": [str(STATE_ROOT / "bin" / "asmr-library"), "fill", rj],
+                            "fix-content": [str(STATE_ROOT / "bin" / "asmr-fix-content-workflow"), rj],
+                            "subs-dry-run": [str(STATE_ROOT / "bin" / "asmr-library"), "subs", "fetch", rj, "--dry-run"],
+                            "subs-fetch": [str(STATE_ROOT / "bin" / "asmr-library"), "subs", "fetch", rj],
+                        }
+                        if name not in mapping:
+                            self._json({"error": "unknown action"}, 404)
+                            return
+                        rec = dash.queue_action(name, mapping[name], timeout=1800)
+                except dash.ActionConflictError as e:
+                    self._json(
+                        {"error": str(e), "running_action": e.record},
+                        HTTPStatus.CONFLICT,
+                    )
+                    return
                 self._json(rec, 202)
                 return
             if path == "/api/auth/me":
@@ -2018,6 +2027,7 @@ class AsmrViewHandler(BaseHTTPRequestHandler):
             else:
                 start = int(s)
                 end = int(e) if e else file_size - 1
+                end = min(end, file_size - 1)
             if start > end or start >= file_size:
                 self.send_response(HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE)
                 self.send_header("Content-Range", f"bytes */{file_size}")
@@ -2373,63 +2383,159 @@ class AsmrViewHandler(BaseHTTPRequestHandler):
     # CLI
     # ---------------------------------------------------------------------------
 
+def _read_pid() -> int | None:
+    try:
+        pid = int(PID_PATH.read_text(encoding="utf-8").strip())
+    except (FileNotFoundError, OSError, ValueError):
+        return None
+    return pid if pid > 0 else None
+
+
+def _pid_is_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+def _process_command(pid: int) -> str:
+    try:
+        return subprocess.check_output(
+            ["ps", "-ww", "-p", str(pid), "-o", "command="],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def _is_viewer_process(pid: int) -> bool:
+    command = _process_command(pid)
+    script = str(Path(__file__).resolve())
+    return bool(command and script in command and "_serve_foreground" in command)
+
+
+def _pid_file_matches(pid: int) -> bool:
+    return _read_pid() == pid
+
+
+def _remove_pid_file(pid: int | None = None) -> None:
+    if pid is not None and not _pid_file_matches(pid):
+        return
+    PID_PATH.unlink(missing_ok=True)
+
+
+def _write_pid_file(pid: int) -> None:
+    PID_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp = PID_PATH.with_name(f".{PID_PATH.name}.{pid}.tmp")
+    try:
+        tmp.write_text(str(pid), encoding="utf-8")
+        os.replace(tmp, PID_PATH)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def _health_data(port: int, timeout: float = 1.0) -> dict | None:
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/health", timeout=timeout) as response:
+            if not 200 <= response.status < 400:
+                return None
+            data = json.loads(response.read())
+            return data if isinstance(data, dict) and data.get("ok") else None
+    except Exception:
+        return None
+
+
+def _terminate_child(proc: subprocess.Popen, timeout: float = 3.0) -> None:
+    if proc.poll() is not None:
+        return
+    proc.terminate()
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait(timeout=timeout)
+
+
 def cmd_start(args):
     host = args.host
     port = args.port
-    try:
-        build_cover_cache()
-    except Exception as e:
-        import traceback
-        print(f"build_cover_cache FAILED: {e}")
-        traceback.print_exc()
-        sys.exit(1)
-    if PID_PATH.exists():
+    START_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with START_LOCK_PATH.open("a+", encoding="utf-8") as lock_file:
         try:
-            pid = int(PID_PATH.read_text().strip())
-            os.kill(pid, 0)
-            print(f"already running (pid {pid}) on http://{host}:{port}")
-            return
-        except (OSError, ValueError):
-            PID_PATH.unlink(missing_ok=True)
-    # Use subprocess.Popen with start_new_session=True to fully
-    # detach from the controlling terminal. This is more reliable
-    # on macOS than os.fork + os.setsid because the child is
-    # launched as a brand new top-level process, not a fork of the
-    # current shell lineage.
-    log_fp = open(LOG_PATH, "ab")
-    # Build a re-exec command. We can't import from a running module
-    # easily, so re-exec the same script with the special
-    # `_serve_foreground` subcommand that bypasses the fork.
-    import subprocess
-    proc = subprocess.Popen(
-        [
-            sys.executable,
-            __file__,
-            "--host", host,
-            "--port", str(port),
-            "_serve_foreground",
-        ],
-        stdin=subprocess.DEVNULL,
-        stdout=log_fp,
-        stderr=log_fp,
-        start_new_session=True,
-        close_fds=True,
-    )
-    log_fp.close()
-    pid = proc.pid
-    # 0.0.0.0 is not a valid target for health check; use 127.0.0.1
-    check_host = "127.0.0.1" if host == "0.0.0.0" else host
-    for _ in range(20):
-        time.sleep(0.2)
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print("start already in progress")
+            return 1
         try:
-            with urllib.request.urlopen(f"http://{check_host}:{port}/api/health", timeout=1) as r:
-                data = json.loads(r.read())
-                print(f"started (pid {pid}) on http://{host}:{port}  works={data.get('works')}  covers={data.get('covers')}")
-                return
-        except Exception:
-            continue
-    print(f"started (pid {pid}) but health check failed; see {LOG_PATH}")
-    return
+            pid = _read_pid()
+            if pid is not None and _pid_is_alive(pid):
+                if not _is_viewer_process(pid):
+                    print(f"stale pid file points to non-viewer process {pid}; cleaning up")
+                    _remove_pid_file(pid)
+                else:
+                    command = _process_command(pid)
+                    host_match = re.search(r"(?:^|\s)--host(?:\s+|=)([^\s]+)", command)
+                    port_match = re.search(r"(?:^|\s)--port(?:\s+|=)(\d+)", command)
+                    running_host = host_match.group(1) if host_match else host
+                    running_port = int(port_match.group(1)) if port_match else port
+                    data = _health_data(running_port, timeout=2)
+                    if data is None:
+                        print(
+                            f"viewer pid {pid} is alive but health check failed "
+                            f"on port {running_port}"
+                        )
+                        return 1
+                    print(
+                        f"already running (pid {pid}) on http://{running_host}:{running_port}  "
+                        f"works={data.get('works')}  covers={data.get('covers')}"
+                    )
+                    return 0
+            elif pid is not None:
+                print(f"stale pid {pid}; cleaning up")
+                _remove_pid_file(pid)
+            elif PID_PATH.exists():
+                print("invalid pid file; cleaning up")
+                _remove_pid_file()
+
+            # Re-exec as a new session so the viewer survives its caller.
+            with LOG_PATH.open("ab") as log_file:
+                proc = subprocess.Popen(
+                    [
+                        sys.executable,
+                        str(Path(__file__).resolve()),
+                        "--host", host,
+                        "--port", str(port),
+                        "_serve_foreground",
+                    ],
+                    stdin=subprocess.DEVNULL,
+                    stdout=log_file,
+                    stderr=log_file,
+                    start_new_session=True,
+                    close_fds=True,
+                )
+
+            for _ in range(50):
+                time.sleep(0.2)
+                if proc.poll() is not None:
+                    print(f"viewer failed to start (exit {proc.returncode}); see {LOG_PATH}")
+                    _remove_pid_file(proc.pid)
+                    return 1
+                data = _health_data(port)
+                if data is not None and _pid_file_matches(proc.pid):
+                    print(
+                        f"started (pid {proc.pid}) on http://{host}:{port}  "
+                        f"works={data.get('works')}  covers={data.get('covers')}"
+                    )
+                    return 0
+
+            _terminate_child(proc)
+            _remove_pid_file(proc.pid)
+            print(f"viewer failed health check and was stopped; see {LOG_PATH}")
+            return 1
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
 def cmd_serve_foreground(args):
@@ -2447,79 +2553,116 @@ def cmd_serve_foreground(args):
         import traceback
         print(f"build_cover_cache FAILED: {e}", flush=True)
         traceback.print_exc()
-        sys.exit(1)
-    PID_PATH.write_text(str(os.getpid()))
+        return 1
     try:
         server = ThreadingHTTPServer((host, port), AsmrViewHandler)
     except Exception as e:
         import traceback
         print(f"ThreadingHTTPServer FAILED: {e}", flush=True)
         traceback.print_exc()
-        sys.exit(1)
+        return 1
+    _write_pid_file(os.getpid())
+
+    def stop_signal(_signum, _frame):
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGTERM, stop_signal)
+    signal.signal(signal.SIGINT, stop_signal)
     print(f"asmr-view serving on http://{host}:{port}", flush=True)
     try:
         server.serve_forever()
+    except KeyboardInterrupt:
+        pass
     except Exception as e:
         import traceback
         print(f"asmr-view serve_forever FAILED: {e}", flush=True)
         traceback.print_exc()
         raise
     finally:
+        dashboard = _DASHBOARD_MODULE
+        if dashboard is not None and hasattr(dashboard, "cancel_running_actions"):
+            dashboard.cancel_running_actions("viewer shutting down")
         server.server_close()
-        PID_PATH.unlink(missing_ok=True)
+        _remove_pid_file(os.getpid())
+    return 0
 
 
 def cmd_stop(args):
-    if not PID_PATH.exists():
+    pid = _read_pid()
+    if pid is None:
+        if PID_PATH.exists():
+            print("invalid pid file; cleaning up")
+            _remove_pid_file()
+            return 1
         print("not running")
-        return
-    pid = int(PID_PATH.read_text().strip())
+        return 0
+    if not _pid_is_alive(pid):
+        print(f"stale pid {pid}; cleaning up")
+        _remove_pid_file(pid)
+        return 0
+    if not _is_viewer_process(pid):
+        print(f"refusing to stop non-viewer process {pid}; stale pid file removed")
+        _remove_pid_file(pid)
+        return 1
     try:
         os.kill(pid, signal.SIGTERM)
-        for _ in range(20):
+        for _ in range(50):
             time.sleep(0.1)
-            try:
-                os.kill(pid, 0)
-            except OSError:
+            if not _pid_is_alive(pid):
                 print(f"stopped (pid {pid})")
-                return
+                _remove_pid_file(pid)
+                return 0
         os.kill(pid, signal.SIGKILL)
-        print(f"force-killed (pid {pid})")
+        for _ in range(30):
+            time.sleep(0.1)
+            if not _pid_is_alive(pid):
+                print(f"force-killed (pid {pid})")
+                _remove_pid_file(pid)
+                return 0
+        print(f"stop failed: pid {pid} remained alive after SIGKILL")
+        return 1
+    except ProcessLookupError:
+        print(f"stopped (pid {pid})")
+        _remove_pid_file(pid)
+        return 0
     except OSError as e:
         print(f"stop failed: {e}")
-    finally:
-        PID_PATH.unlink(missing_ok=True)
+        return 1
 
 
 def cmd_status(args):
-    if not PID_PATH.exists():
-        print("not running")
-        return
-    pid = int(PID_PATH.read_text().strip())
-    try:
-        os.kill(pid, 0)
-    except OSError:
+    pid = _read_pid()
+    if pid is None:
+        if PID_PATH.exists():
+            print("invalid pid file; cleaning up")
+            _remove_pid_file()
+        else:
+            print("not running")
+        return 1
+    if not _pid_is_alive(pid):
         print(f"stale pid {pid}; cleaning up")
-        PID_PATH.unlink(missing_ok=True)
-        return
+        _remove_pid_file(pid)
+        return 1
+    if not _is_viewer_process(pid):
+        print(f"pid {pid} belongs to a different process; stale pid file removed")
+        _remove_pid_file(pid)
+        return 1
+    command = _process_command(pid)
     port = args.port
-    bind_host = "unknown"
-    try:
-        command = subprocess.check_output(["ps", "-p", str(pid), "-o", "command="], text=True).strip()
-        match = re.search(r"(?:^|\s)--host(?:\s+|=)([^\s]+)", command)
-        if match:
-            bind_host = match.group(1)
-    except Exception:
-        pass
-    try:
-        with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/health", timeout=2) as r:
-            data = json.loads(r.read())
-            print(
-                f"running (pid {pid})  bind={bind_host}:{port}  "
-                f"local_url=http://127.0.0.1:{port}  works={data.get('works')}  covers={data.get('covers')}"
-            )
-    except Exception as e:
-        print(f"pid {pid} alive but http not responding: {e}")
+    host_match = re.search(r"(?:^|\s)--host(?:\s+|=)([^\s]+)", command)
+    port_match = re.search(r"(?:^|\s)--port(?:\s+|=)(\d+)", command)
+    bind_host = host_match.group(1) if host_match else "unknown"
+    if port_match:
+        port = int(port_match.group(1))
+    data = _health_data(port, timeout=2)
+    if data is None:
+        print(f"viewer pid {pid} is alive but http is not responding on port {port}")
+        return 1
+    print(
+        f"running (pid {pid})  bind={bind_host}:{port}  "
+        f"local_url=http://127.0.0.1:{port}  works={data.get('works')}  covers={data.get('covers')}"
+    )
+    return 0
 
 
 def cmd_open(args):
@@ -2568,8 +2711,8 @@ def main():
     s.set_defaults(func=cmd_logs)
 
     args = p.parse_args()
-    args.func(args)
+    return int(args.func(args) or 0)
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
